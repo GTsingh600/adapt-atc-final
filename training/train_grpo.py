@@ -637,9 +637,25 @@ def train(
                     reward_log[role].append(r)
                 reward_log["composite"].append(r)
 
+            # ── Parseable log line every 20 reward calls ──────────────────
+            # Notebook parses [ATC_REWARD step=N] lines for live display.
+            call_count = len(reward_log["composite"])
+            if call_count % 20 == 0 and call_count > 0:
+                tail = 10
+                role_parts = []
+                for _role in ("AMAN", "DMAN", "GENERATOR", "SUPERVISOR", "ADAPT"):
+                    rs = reward_log.get(_role, [])
+                    if rs:
+                        mean_r = sum(rs[-tail:]) / min(tail, len(rs))
+                        role_parts.append(f"{_role}={mean_r:.4f}")
+                comp = reward_log["composite"]
+                comp_mean = sum(comp[-tail:]) / min(tail, len(comp)) if comp else 0.0
+                role_parts.append(f"composite={comp_mean:.4f}")
+                print(f"[ATC_REWARD step={call_count}] {' '.join(role_parts)}", flush=True)
+
             # Reward-hacking detection: warn when composite rises but per-role variance
             # collapses (all roles getting same score = likely gaming)
-            if len(reward_log["composite"]) % 50 == 0 and len(reward_log["composite"]) > 50:
+            if call_count % 50 == 0 and call_count > 50:
                 _check_reward_hacking(reward_log)
 
             return rewards
