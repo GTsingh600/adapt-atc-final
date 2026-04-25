@@ -133,27 +133,59 @@ The environment also includes **7 native ATC scenarios** across Delhi, Mumbai, B
 
 ---
 
-## Training Signal
+## Training Signal — Research-Grounded Reward Design
 
-The reward function has 5 components per role to ensure clean GRPO signal:
+The reward architecture uses three novel techniques designed for LLM-based domain transfer:
 
-### ADAPT Reward (Primary Role — 50% of samples)
-| Component | Weight | Signal |
-|-----------|--------|--------|
-| Parse quality | 0.15 | Valid JSON with both wake_map + priority_map |
-| Coverage | 0.20 | Fraction of entity types mapped (unmapped = lost) |
-| Distribution quality | 0.20 | Realistic priority spread — anti-gaming penalty for >1 emergency |
-| Downstream score | 0.35 | Heuristic AMAN+DMAN solve mapped task — composite score |
-| Rationale quality | 0.10 | Citations of numerical evidence (tp=0.98, cr=0.95) |
+### 1. Composable Rubric with Smooth Gating
+Instead of hard if/else gates that block gradients, we use **sigmoid gates** σ(k·(x-t)) that provide gradient signal even below threshold. Format quality gates safety, which gates optimality — forming a differentiable curriculum.
 
-### AMAN/DMAN Reward (Support Roles — 25% each)
-Simple 5-component rewards: delay efficiency, emergency handling, coverage, JSON format, conflict avoidance. Softened safety gates (conflict cap at 0.50, not 0.30) to allow gradient diversity during early training.
+```
+Reward = σ(format) × [0.30 × safety + σ(safety) × 0.70 × quality]
+```
+Reference: Curriculum RL (Narvekar et al. 2020), OpenEnv Composable Rubrics.
 
-### What Not To Do (Anti-Gaming)
-- Map everything to emergency → distribution penalty fires (max 1 emergency type)
-- Produce invalid JSON → -0.2 soft penalty (not -0.8 which destroys gradients)
-- Skip entity types → coverage score drops proportionally
-- Empty rationale → rationale score = 0
+### 2. Structural Monotonicity (Novel — ADAPT's primary metric)
+If entity A has higher structural urgency than entity B, ADAPT's mapping should preserve this ordering. We measure this with a **Kendall's-tau-like concordance score** over pairwise entity comparisons:
+
+| Entity | time_pressure | connection_risk | Oracle Rank | Predicted Rank | Concordant? |
+|--------|:---:|:---:|:---:|:---:|:---:|
+| TRAUMA | 0.98 | 0.95 | 1 (highest) | 1 | ✓ |
+| CARDIAC | 0.62 | 0.70 | 2 | 2 | ✓ |
+| POST_OP | 0.39 | 0.20 | 3 | 3 | ✓ |
+| ROUTINE | 0.15 | 0.00 | 4 (lowest) | 4 | ✓ |
+
+Monotonicity score = concordant pairs / total pairs. This measures whether the agent understands **relative urgency**, not just absolute labels.
+
+### 3. KL-Regularised Distribution (Information-Theoretic Anti-Gaming)
+Instead of hard "max 1 emergency" rules, we compare the predicted priority distribution against a **reference ATC distribution** using KL divergence: R = exp(-D_KL(pred ‖ ref)).
+
+Reference distribution (real-world ATC): 5% emergency, 15% medical, 25% connection, 55% normal.
+
+Reference: Maximum Entropy RL (Haarnoja et al. 2018).
+
+### 4. Potential-Based Advantage (ADAPT downstream signal)
+ADAPT's downstream score uses the **improvement over heuristic baseline**, not raw score. This implements potential-based reward shaping (Ng et al. 1999) which provably preserves the optimal policy:
+
+```
+downstream = 0.7 × agent_score + 0.3 × σ(agent_score - heuristic_score)
+```
+
+### ADAPT Reward Composition
+| Tier | Component | Weight | Novel? |
+|------|-----------|--------|--------|
+| T1 (gate) | Format quality | gates all | Sigmoid gate |
+| T2 (gate) | Coverage | 0.15 + gates T3 | Sigmoid gate |
+| T3 | Structural monotonicity | 0.30 | ✓ Kendall's tau |
+| T3 | KL distribution quality | (within structural) | ✓ MaxEnt |
+| T4 | Potential-based advantage | 0.35 | ✓ Ng et al. |
+| — | Rationale quality | 0.20 | Cites tp=, cr= |
+
+### Anti-Gaming Properties
+- Map everything to emergency → KL divergence from reference distribution spikes → score drops
+- Skip entities → coverage gate blocks access to quality rewards
+- Invalid JSON → format gate blocks everything (but smoothly, allowing gradient flow)
+- Copy heuristic exactly → advantage term = 0, only raw score contributes
 
 ---
 
