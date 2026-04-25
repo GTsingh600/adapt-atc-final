@@ -326,11 +326,24 @@ def train_sft(
 
     trainer.train()
 
-    # Save final checkpoint
+    # Save merged checkpoint — LoRA weights fused into base model so GRPO
+    # can load a clean model and apply its own fresh LoRA adapter.
     final_dir = str(Path(output_dir) / "sft-final")
-    model.save_pretrained(final_dir)
-    tokenizer.save_pretrained(final_dir)
-    print(f"\n  SFT checkpoint saved to: {final_dir}")
+    print(f"\n  Merging LoRA into base weights and saving to: {final_dir}")
+    try:
+        # Unsloth preferred path: saves merged model re-quantized to 4-bit
+        model.save_pretrained_merged(final_dir, tokenizer, save_method="merged_4bit_forced")
+    except Exception as e1:
+        print(f"  [WARN] save_pretrained_merged failed ({e1}), trying merge_and_unload...")
+        try:
+            merged = model.merge_and_unload()
+            merged.save_pretrained(final_dir)
+            tokenizer.save_pretrained(final_dir)
+        except Exception as e2:
+            print(f"  [WARN] merge_and_unload failed ({e2}), saving raw LoRA checkpoint")
+            model.save_pretrained(final_dir)
+            tokenizer.save_pretrained(final_dir)
+    print(f"  SFT checkpoint (merged) saved to: {final_dir}")
     print(f"  Use this as --model for GRPO: python training/train_grpo.py --model {final_dir}")
 
     return final_dir

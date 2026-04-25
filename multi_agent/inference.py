@@ -476,10 +476,10 @@ def run_episode(
             "conflicts_resolved": resolved,
             "total_messages": total_msgs,
             "aman_alternatives_offered": sum(
-                len(m.proposed_alternatives) for m in aman_action2.outgoing_messages
+                len(getattr(m, "proposed_alternatives", [])) for m in aman_action2.outgoing_messages
             ),
             "dman_alternatives_offered": sum(
-                len(m.proposed_alternatives) for m in dman_action2.outgoing_messages
+                len(getattr(m, "proposed_alternatives", [])) for m in dman_action2.outgoing_messages
             ),
         })
 
