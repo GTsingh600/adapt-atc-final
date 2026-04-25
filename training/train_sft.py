@@ -251,11 +251,40 @@ def train_sft(
     from datasets import Dataset
     dataset = Dataset.from_list(sft_data)
 
+    # Unsloth SFTTrainer requires a formatting_func when the dataset uses
+    # the `messages` key (chat format).  We apply the tokenizer's chat template
+    # to produce a single formatted string per sample.
+    def _formatting_func(examples):
+        texts = []
+        msgs_batch = examples.get("messages", [])
+        for msgs in msgs_batch:
+            try:
+                text = tokenizer.apply_chat_template(
+                    msgs,
+                    tokenize=False,
+                    add_generation_prompt=False,
+                )
+            except Exception:
+                # Fallback: naive concatenation if template fails
+                text = "\n".join(
+                    f"<|{m['role']}|>\n{m['content']}" for m in msgs
+                )
+            texts.append(text)
+        return texts
+
     # ── 4. Train ─────────────────────────────────────────────────────────
     print(f"[4/4] Starting SFT training ({num_epochs} epochs)...\n")
     from trl import SFTConfig, SFTTrainer
+    import inspect as _inspect
 
     os.makedirs(output_dir, exist_ok=True)
+
+    _use_bf16 = False
+    try:
+        import torch as _torch
+        _use_bf16 = _torch.cuda.is_available() and _torch.cuda.is_bf16_supported()
+    except Exception:
+        pass
 
     sft_config = SFTConfig(
         output_dir=output_dir,
@@ -268,19 +297,26 @@ def train_sft(
         save_steps=SAVE_STEPS,
         save_total_limit=2,
         seed=seed,
-        bf16=False,    # T4 doesn't support bf16
-        fp16=True,
+        bf16=_use_bf16,
+        fp16=not _use_bf16,
         max_seq_length=MAX_SEQ_LEN,
-        packing=True,  # pack short samples together for efficiency
+        packing=True,
         report_to="none",
     )
 
-    trainer = SFTTrainer(
-        model=model,
-        tokenizer=tokenizer,
-        train_dataset=dataset,
-        args=sft_config,
-    )
+    _trainer_kwargs: dict = {
+        "model":           model,
+        "tokenizer":       tokenizer,
+        "train_dataset":   dataset,
+        "formatting_func": _formatting_func,
+        "args":            sft_config,
+    }
+    # Some TRL versions use `processing_class` instead of `tokenizer`
+    _sft_sig = _inspect.signature(SFTTrainer.__init__).parameters
+    if "processing_class" in _sft_sig and "tokenizer" not in _sft_sig:
+        _trainer_kwargs["processing_class"] = _trainer_kwargs.pop("tokenizer")
+
+    trainer = SFTTrainer(**_trainer_kwargs)
 
     trainer.train()
 
