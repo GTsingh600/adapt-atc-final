@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
-"""ATC Multi-Agent GRPO Training — Colab Notebook
+"""ADAPT-Focused ATC Multi-Agent GRPO Training — Colab Notebook
+
+ADAPT (Adaptive Decision Agent for Problem Transfer) is the primary training target.
+It learns to map unknown scheduling domains to ATC parameters using structural reasoning.
+
 Runtime → Change runtime type → T4 GPU
 Run cells top-to-bottom.
 """
@@ -13,10 +17,10 @@ drive.mount("/content/drive")
 
 import subprocess, sys, os
 
-BRANCH     = "multiagent-readme-sync"   # change to "main" once merged
+BRANCH     = "main"
 REPO_URL   = "https://github.com/GTsingh600/ats.git"
 REPO_DIR   = "/content/ATC"
-OUTPUT_DIR = "/content/drive/MyDrive/atc-multiagent"
+OUTPUT_DIR = "/content/drive/MyDrive/atc-adapt"
 
 subprocess.run(["rm", "-rf", REPO_DIR], check=True)
 subprocess.run(
@@ -82,41 +86,38 @@ if torch.cuda.is_available():
     print(f"GPU         : {torch.cuda.get_device_name(0)}")
     print(f"VRAM        : {props.total_memory / 1e9:.1f} GB")
 
-# Repo imports
+# Repo imports — verify ADAPT-focused dataset builds correctly
 from training.dataset import build_episode_dataset
-data = build_episode_dataset(n_episodes=2, seed=42)
-print(f"\nDataset smoke: {len(data)} samples | roles: {sorted({x['agent_role'] for x in data})}")
+data = build_episode_dataset(n_episodes=4, seed=42)
+roles = sorted({x['agent_role'] for x in data})
+print(f"\nDataset smoke: {len(data)} samples | roles: {roles}")
+print(f"  Expected: ADAPT + AMAN + DMAN (3 roles)")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Cell 4 — Train  (in-process — full tracebacks visible)
+# Cell 4 — Train ADAPT-Focused Model
 #
-# T4 safe settings:  N_GENERATIONS=2, BATCH_SIZE=2, GRAD_ACCUM=4
-#   → effective batch = 8, group size = 2
-# A100 / better VRAM: set N_GENERATIONS=4 for more stable advantage estimates
+# T4 settings: N_GENERATIONS=2, BATCH_SIZE=2, GRAD_ACCUM=8
+#   → effective batch = 16, group size = 2
 #
-# run_eval=True  → runs base-model eval BEFORE training and trained-model eval
-#                  AFTER training, prints before/after comparison table.
-#                  Each eval pass ≈ 15 min on T4 (3 model inference episodes).
-#                  Set run_eval=False to skip and save ~30 min total.
+# Model choices:
+#   Qwen/Qwen2.5-1.5B-Instruct  — faster, fits T4 easily, good for iteration
+#   Qwen/Qwen2.5-7B-Instruct    — higher quality, needs more VRAM
+#
+# run_eval=True → runs base-model eval BEFORE and trained-model eval AFTER
 # ══════════════════════════════════════════════════════════════════════════════
 
 import training.train_grpo as _grpo
 
-# Override memory-critical constants for T4 before training starts
-_grpo.N_GENERATIONS = 2   # 2 = T4 safe; 4 = better gradient quality (A100)
-_grpo.BATCH_SIZE    = 2   # must stay divisible by N_GENERATIONS
-_grpo.GRAD_ACCUM    = 4   # effective batch = BATCH_SIZE * GRAD_ACCUM = 8
-
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 _grpo.train(
-    model_name  = "Qwen/Qwen2.5-7B-Instruct",
+    model_name  = "Qwen/Qwen2.5-1.5B-Instruct",   # use 7B for higher quality
     output_dir  = OUTPUT_DIR,
-    n_episodes  = 50,       # ~2 hr on T4; use 200 for full training
-    lora_rank   = 16,
+    n_episodes  = 100,       # ~1 hr on T4 for 1.5B; use 200+ for full training
+    lora_rank   = 32,
     seed        = 42,
-    run_eval    = True,     # set False to skip before/after model inference
+    run_eval    = True,
 )
 
 
@@ -147,9 +148,7 @@ for png in sorted(Path(PLOTS_DIR).glob("*.png")):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Cell 6 — Standalone Eval  (optional — already runs inside Cell 4)
-#
-# Use this only if you want more episodes or re-run eval separately.
+# Cell 6 — Standalone Eval  (optional — already included in Cell 4)
 # ══════════════════════════════════════════════════════════════════════════════
 
 import json
@@ -179,24 +178,21 @@ if Path(EVAL_OUT).exists():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Cell 7 — Heuristic Sanity Check  (no model needed)
-# Verifies multi-agent environment works end-to-end.
+# Cell 7 — Heuristic Sanity Check  (no model needed — verifies environment)
 # ══════════════════════════════════════════════════════════════════════════════
 
 from multi_agent.environment import MultiAgentATCEnvironment
-from multi_agent.generator import ChallengeGenerator
 from multi_agent.supervisor import SupervisorAgent
 from multi_agent.inference import run_episode
 
 env = MultiAgentATCEnvironment(seed=0)
-gen = ChallengeGenerator(seed=0)
 sup = SupervisorAgent()
 
 result = run_episode(
     task_id      = "bengaluru_irrops_hard",
     client       = None,          # heuristic mode — no LLM
     env          = env,
-    generator    = gen,
+    generator    = None,
     supervisor   = sup,
     episode_id   = 0,
     use_generator= False,

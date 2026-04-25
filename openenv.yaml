@@ -1,13 +1,13 @@
 spec_version: 1
 name: atc_env
-version: 3.0.0
+version: 3.1.0
 description: >
-  Multi-agent RLVE benchmark for air traffic control disruption recovery.
-  AMAN and DMAN controllers coordinate via a 3-round BID/NEGOTIATE/FINAL
-  protocol over shared runways. An adversarial ChallengeGenerator applies
-  EMA-based curriculum mutation. A SupervisorAgent with 5 rotating preference
-  profiles (safety / throughput / fuel / emergency / fairness) provides
-  grounded dense reward. Trained with GRPO + Unsloth 4-bit QLoRA on Colab T4.
+  ADAPT — Zero-Shot Domain Transfer for Scheduling via Structural Reasoning.
+  An LLM-driven meta-agent (ADAPT) maps unknown scheduling domains to ATC
+  parameters using structural signals (time pressure, cascade risk, resource
+  intensity), so existing AMAN/DMAN controllers solve them without retraining.
+  Multi-agent coordination via 3-round BID/NEGOTIATE/FINAL protocol.
+  Trained with GRPO + Unsloth 4-bit QLoRA on Colab T4.
 type: space
 runtime: fastapi
 app: server.app:app
@@ -18,11 +18,12 @@ tags:
 - multi-agent
 - rlve
 - grpo
+- domain-transfer
+- structural-reasoning
+- adapt
 - cooperative-competitive
-- self-play
 - aman
 - dman
-- curriculum-learning
 
 # ── Primary interface (OpenEnv-compliant) ─────────────────────────────────────
 action_space: atc_env.models:ATCAction
@@ -34,6 +35,13 @@ multi_agent:
   enabled: true
   mode: cooperative_competitive
   agents:
+    - role: ADAPT
+      description: >
+        Domain Transfer Agent — reads structural signals from unknown scheduling
+        domains and infers ATC parameter mappings (wake_class + priority) so
+        AMAN/DMAN can solve any scheduling problem without code changes.
+      action_space: multi_agent.models:ADAPTAction
+      observation_space: multi_agent.models:ADAPTObservation
     - role: AMAN
       description: Arrival Manager — sequences inbound flights, manages wake turbulence separation
       action_space: multi_agent.models:AMANAction
@@ -42,56 +50,44 @@ multi_agent:
       description: Departure Manager — schedules outbound flights, enforces ATFM network slots
       action_space: multi_agent.models:DMANAction
       observation_space: multi_agent.models:MultiAgentObservation
-    - role: GENERATOR
-      description: Adversarial self-play agent — mutates tasks via EMA curriculum to challenge controllers
-      action_space: multi_agent.models:GeneratorAction
-      observation_space: multi_agent.models:MultiAgentObservation
-    - role: SUPERVISOR
-      description: >
-        Expert with rotating preference profiles (safety_strict / throughput_max /
-        fuel_economy / emergency_priority / fairness_balanced)
-      action_space: null
-      observation_space: multi_agent.models:MultiAgentObservation
   negotiation_rounds: 3
   protocol: BID -> NEGOTIATE -> FINAL
   shared_runways: true
   emergency_broadcast: true
 
-# ── Reward design ─────────────────────────────────────────────────────────────
+# ── Reward design — ADAPT-focused ─────────────────────────────────────────────
 reward:
-  type: potential_based_shaping  # Ng et al. 1999 — preserves optimal policy
+  type: composable_5_component
   roles:
+    ADAPT:
+      components: [parse_quality, coverage, distribution_quality, downstream_score, rationale_quality]
+      weights: [0.15, 0.20, 0.20, 0.35, 0.10]
+      anti_gaming: distribution_penalty prevents all-emergency mapping
     AMAN:
-      components: [delay_efficiency, emergency_score, coverage, counterfactual_advantage,
-                   theory_of_mind_bonus, supervisor_alignment, rationale_quality, json_format]
+      components: [delay_efficiency, emergency_score, coverage, json_format, conflict_free]
+      weights: [0.35, 0.25, 0.20, 0.10, 0.10]
       hard_gates:
-        conflict_free: {cap: 0.30, condition: "conflict_count > 0"}
-        emergency:     {cap: 0.40, condition: "emg_miss > 0"}
-        coverage_floor: {penalty: -0.30, condition: "coverage < 0.50"}
+        conflict_free: {cap: 0.50, condition: "conflict_count > 0"}
+        emergency:     {cap: 0.60, condition: "emg_miss > 0"}
     DMAN:
-      components: [delay_efficiency, atfm_compliance, emergency_score, coverage,
-                   counterfactual_advantage, theory_of_mind_bonus, supervisor_alignment,
-                   rationale_quality, json_format]
+      components: [delay_efficiency, emergency_score, atfm_compliance, coverage, json_format, conflict_free]
+      weights: [0.30, 0.20, 0.20, 0.15, 0.10, 0.05]
       hard_gates:
-        conflict_free: {cap: 0.30, condition: "conflict_count > 0"}
-        emergency:     {cap: 0.40, condition: "emg_miss > 0"}
-        coverage_floor: {penalty: -0.30, condition: "coverage < 0.50"}
-    GENERATOR:
-      components: [challenge_score, solvability_bonus]
-    SUPERVISOR:
-      components: [preference_alignment, calibration_bonus]
+        conflict_free: {cap: 0.50, condition: "conflict_count > 0"}
+        emergency:     {cap: 0.60, condition: "emg_miss > 0"}
 
-# ── Graders ───────────────────────────────────────────────────────────────────
+# ── Graders (3-layer gated design) ───────────────────────────────────────────
 graders:
   primary:
-    - module: graders:MultiAgentCoordinationGrader
-      weight: 0.40
     - module: graders:GatedCompositeGrader
-      weight: 0.45
+      weight: 0.50
+      description: "Layer 1 Safety Gate → Layer 2 Priority → Layer 3 Efficiency"
+    - module: graders:MultiAgentCoordinationGrader
+      weight: 0.35
     - module: graders:LLMSupervisorGrader
       weight: 0.15
 
-# ── Tasks ─────────────────────────────────────────────────────────────────────
+# ── Tasks — ATC scenarios ────────────────────────────────────────────────────
 tasks:
 - id: delhi_monsoon_recovery_easy
   difficulty: easy
@@ -139,15 +135,34 @@ tasks:
   max_steps: 20
   multi_agent_max_rounds: 3
 
-# ── Training ──────────────────────────────────────────────────────────────────
+# ── Domain-transfer tasks (ADAPT) ────────────────────────────────────────────
+domain_tasks:
+- id: icu_normal_day
+  domain: Hospital ICU Surge Management
+  difficulty: easy
+  description: "Routine ICU bed turnover — 4 admissions, 4 discharges, 4 beds"
+
+- id: icu_flu_surge
+  domain: Hospital ICU Surge Management
+  difficulty: medium
+  description: "Flu surge — 3 concurrent CARDIAC admissions + transfer-auth deadlines"
+
+- id: icu_mass_casualty
+  domain: Hospital ICU Surge Management
+  difficulty: hard
+  description: "Mass casualty — 3 simultaneous TRAUMA emergencies + CARDIAC queue"
+
+# ── Training — ADAPT-focused ─────────────────────────────────────────────────
 training:
   algorithm: GRPO
-  n_generations: 4
-  kl_coeff: 0.01
+  n_generations: 2
+  kl_coeff: 0.0
   framework: unsloth + trl
-  base_model: Qwen/Qwen2.5-7B-Instruct
+  base_model: Qwen/Qwen2.5-1.5B-Instruct
   colab_compatible: true
   vram_requirement: 16GB
-  lora_rank: 16
+  lora_rank: 32
+  learning_rate: 5e-6
+  training_mix: "50% ADAPT, 25% AMAN, 25% DMAN"
   script: training/train_grpo.py
   reward_functions: training/reward_functions.py

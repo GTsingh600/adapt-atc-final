@@ -1,33 +1,21 @@
-"""Multi-Agent ATC GRPO Training with Unsloth.
+"""ADAPT-Focused Multi-Agent ATC GRPO Training with Unsloth.
 
 Architecture:
-  - Single LLM (Qwen2.5-7B-Instruct) plays 5 roles via system prompts
+  - Single LLM plays 3 roles via system prompts: ADAPT (primary), AMAN, DMAN
   - GRPO: group-relative advantage  A_i = (r_i - mean(group)) / (std(group) + eps)
-  - Five independent reward functions (AMAN, DMAN, GENERATOR, SUPERVISOR, ADAPT)
-  - Seven novel loss components: temporal credit, hierarchical decomposition,
-    recovery gradient, contrastive pair, info-theoretic coordination,
-    causal credit assignment, adaptive KL regularization
-  - Self-adapting curriculum: ContextAdaptiveCurriculum diagnoses agent weaknesses
-    and generates targeted scenarios (replaces blind EMA escalation)
-  - Long-horizon planning support: multi-epoch episodes (Theme #2)
+  - ADAPT: domain transfer agent — maps unknown domains to ATC parameters
+  - AMAN/DMAN: support roles for JSON format learning and scheduling vocabulary
+  - Simplified 5-component rewards per role for stable convergence
   - Per-role reward curves saved to reward_curves.json for demo
 
-Modes:
-  --lora (default)   4-bit QLoRA, rank=16, Colab T4 compatible
-  --full_model       Whole-model fine-tuning, layer-wise LR decay, A100/H100
-
-Training loop (standard):
-  Episode → Adaptive curriculum → AMAN bids → DMAN bids →
-  Negotiate (if conflicts) → Grade → Per-agent GRPO update
-
-Training loop (long-horizon, --long_horizon):
-  Episode → 4 planning epochs → per-epoch AMAN+DMAN → cascade detection →
-  Recovery gradient → Long-horizon composite → GRPO update
+Training mix:
+  ~50% domain-transfer (ADAPT) episodes — primary training signal
+  ~25% AMAN episodes — JSON format + arrival scheduling
+  ~25% DMAN episodes — JSON format + departure scheduling
 
 Usage:
-  python training/train_grpo.py [--episodes 200] [--model Qwen/Qwen2.5-7B-Instruct]
-  python training/train_grpo.py --full_model --episodes 500 --output_dir ./outputs/full
-  python training/train_grpo.py --long_horizon --episodes 200
+  python training/train_grpo.py [--episodes 200] [--model Qwen/Qwen2.5-1.5B-Instruct]
+  python training/train_grpo.py --model Qwen/Qwen2.5-7B-Instruct --episodes 300
 
 Colab one-liner (LoRA):
   !python training/train_grpo.py --episodes 100 --output_dir /content/atc-multiagent
@@ -84,61 +72,50 @@ from training.dataset import (
 from training.reward_functions import (
     aman_reward_fn,
     dman_reward_fn,
-    generator_reward_fn,
-    supervisor_reward_fn,
     adapt_reward_fn,
 )
 from multi_agent.environment import MultiAgentATCEnvironment
-from multi_agent.generator import ChallengeGenerator
 from multi_agent.models import AgentRole, SupervisorProfileName
 from multi_agent.supervisor import SupervisorAgent
 from tasks import task_catalog, ordered_tasks
 
 
-# ── Hyperparameters (single unified T4-optimised config) ──────────────────────
+# ── Hyperparameters — ADAPT-focused, 1.5B/7B-stable ──────────────────────────
 #
-# Targeting ALL 7 linear projection types at rank=64 covers ~85% of transformer
-# parameters via low-rank updates — effectively "full model" expressiveness while
-# staying inside Unsloth's stable QLoRA compiled path (no torch.compile crash).
-#
-# Long-horizon planning is always mixed into the dataset (25% of episodes) rather
-# than a separate mode. No flags needed — one training path, always on.
+# Tuned for stable convergence on T4 Colab with Qwen2.5-1.5B to 7B.
+# ADAPT is the primary training role. AMAN/DMAN are support roles.
+# Lower LR + higher grad_accum = more stable updates.
 
-DEFAULT_MODEL  = "Qwen/Qwen2.5-7B-Instruct"
-DEFAULT_OUTPUT = "./outputs/atc-multiagent"
+DEFAULT_MODEL  = "Qwen/Qwen2.5-1.5B-Instruct"
+DEFAULT_OUTPUT = "./outputs/atc-adapt"
 
-# Maximum-coverage QLoRA — all 7 projection types, high rank
-LORA_RANK    = 64
-LORA_ALPHA   = 128   # 2x rank keeps adapter scale stable
+# QLoRA config — all 7 projection types, moderate rank
+LORA_RANK    = 32
+LORA_ALPHA   = 64   # 2x rank keeps adapter scale stable
 LORA_TARGETS = [
     "q_proj", "v_proj", "k_proj", "o_proj",   # attention
     "gate_proj", "up_proj", "down_proj",       # FFN / MLP
 ]
 
-MAX_SEQ_LEN    = 2048   # T4 budget: 2048 > 512 completions, avoids OOM
-MAX_NEW_TOKENS = 512
-TEMPERATURE    = 0.7
-N_GENERATIONS  = 4      # min group size for stable GRPO advantage variance
+MAX_SEQ_LEN    = 1536   # save VRAM for batch size headroom
+MAX_NEW_TOKENS = 384    # ADAPT outputs ~150 tokens
+TEMPERATURE    = 0.8    # slightly more exploration
+N_GENERATIONS  = 2      # T4 practical max
 BATCH_SIZE     = 2
-GRAD_ACCUM     = 4      # effective batch = 8
-LR             = 2e-5   # slightly higher than tiny-LoRA; rank-64 needs more signal
-KL_COEFF       = 0.0    # keep 0.0 — non-zero KL crashes Unsloth+PEFT on trl==0.9.6
-WARMUP_RATIO   = 0.05
+GRAD_ACCUM     = 8      # effective batch = 16 for stable gradients
+LR             = 5e-6   # low LR prevents reward collapse — key fix
+KL_COEFF       = 0.0    # keep 0.0 — non-zero KL crashes Unsloth+PEFT
+WARMUP_RATIO   = 0.10   # longer warmup for early gradient stability
 SAVE_STEPS     = 50
 SAVE_TOTAL_LIMIT = 3
 
-# Long-horizon mixed into dataset (no separate flag)
-LONG_HORIZON_EPISODE_RATIO = 0.25   # 25% of episodes use cascade/multi-epoch scenarios
 
-
-# ── Role-dispatch table ───────────────────────────────────────────────────────
+# ── Role-dispatch table (ADAPT-focused: only 3 roles) ────────────────────────
 
 REWARD_FN_DISPATCH = {
-    AgentRole.AMAN.value:       aman_reward_fn,
-    AgentRole.DMAN.value:       dman_reward_fn,
-    AgentRole.GENERATOR.value:  generator_reward_fn,
-    AgentRole.SUPERVISOR.value: supervisor_reward_fn,
-    AgentRole.ADAPT.value:      adapt_reward_fn,       # meta-agent: domain transfer
+    AgentRole.AMAN.value:  aman_reward_fn,
+    AgentRole.DMAN.value:  dman_reward_fn,
+    AgentRole.ADAPT.value: adapt_reward_fn,   # primary training role
 }
 
 
@@ -440,9 +417,10 @@ def train(
     print(f"  ATC Multi-Agent GRPO Training")
     print(f"  Model:         {model_name}")
     print(f"  Mode:          QLoRA rank={lora_rank} (all 7 projection types)")
-    print(f"  Long-horizon:  25% of episodes (always mixed in)")
+    print(f"  Focus:         ADAPT domain transfer (~50% of samples)")
     print(f"  Episodes:      {n_episodes}")
     print(f"  Generations:   {num_generations} per prompt")
+    print(f"  LR:            {LR}")
     print(f"  Output:        {output_dir}")
     print(f"  Device:        {device_str}")
     print(f"{'='*60}\n")
@@ -494,21 +472,20 @@ def train(
               f"  (AMAN {base_model_metrics['mean_aman_reward']:.3f}"
               f" / DMAN {base_model_metrics['mean_dman_reward']:.3f})")
 
-    # ── 3. Build training dataset ─────────────────────────────────────────────
-    print(f"\n[2/5] Building {n_episodes}-episode multi-agent dataset...")
-    print(f"      ADAPT domain ratio=0.30  |  long-horizon ratio={LONG_HORIZON_EPISODE_RATIO}")
+    # ── 3. Build ADAPT-focused training dataset ────────────────────────────────
+    print(f"\n[2/5] Building {n_episodes}-episode ADAPT-focused dataset...")
+    print(f"      ADAPT domain ratio=0.50  |  Generator=OFF  |  Supervisor=OFF")
     t0 = time.time()
     dataset_raw = build_episode_dataset(
         n_episodes=n_episodes,
         seed=seed,
-        include_generator=True,
-        include_supervisor=True,
+        include_generator=False,
+        include_supervisor=False,
         include_adapt=True,
-        domain_episode_ratio=0.30,      # 30% cross-domain ADAPT episodes
-        long_horizon_ratio=LONG_HORIZON_EPISODE_RATIO,  # 25% cascade/multi-epoch
+        domain_episode_ratio=0.50,      # 50% domain-transfer ADAPT episodes
+        long_horizon_ratio=0.0,         # disabled for stable convergence
     )
     print(f"    Dataset: {len(dataset_raw)} samples ({time.time()-t0:.1f}s)")
-
 
     role_counts: Dict[str, int] = {}
     for s in dataset_raw:
@@ -574,7 +551,7 @@ def train(
 
     # Separate lists so we can show per-role curves in the demo
     reward_log: Dict[str, List[float]] = {
-        "AMAN": [], "DMAN": [], "GENERATOR": [], "SUPERVISOR": [], "ADAPT": [], "composite": []
+        "ADAPT": [], "AMAN": [], "DMAN": [], "composite": []
     }
 
     class RewardLogger:
@@ -625,7 +602,7 @@ def train(
             if call_count % 20 == 0 and call_count > 0:
                 tail = 10
                 role_parts = []
-                for _role in ("AMAN", "DMAN", "GENERATOR", "SUPERVISOR", "ADAPT"):
+                for _role in ("ADAPT", "AMAN", "DMAN"):
                     rs = reward_log.get(_role, [])
                     if rs:
                         mean_r = sum(rs[-tail:]) / min(tail, len(rs))
@@ -1093,14 +1070,14 @@ def evaluate(model_name_or_path: str, n_episodes: int = 20, seed: int = 99) -> D
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="ATC Multi-Agent GRPO Training")
-    parser.add_argument("--model",          default=DEFAULT_MODEL)
+    parser = argparse.ArgumentParser(description="ADAPT-Focused ATC Multi-Agent GRPO Training")
+    parser.add_argument("--model",          default=DEFAULT_MODEL,
+                        help="Base model (default: Qwen/Qwen2.5-1.5B-Instruct)")
     parser.add_argument("--output_dir",     default=DEFAULT_OUTPUT)
     parser.add_argument("--episodes",       type=int, default=200)
     parser.add_argument("--lora_rank",      type=int, default=LORA_RANK)
     parser.add_argument("--n_generations",  type=int, default=None,
-                        help="GRPO group size (default: N_GENERATIONS constant). "
-                             "Use 2 on T4 Colab, 4 for best gradient quality.")
+                        help="GRPO group size (default: 2 for T4 Colab).")
     parser.add_argument("--seed",           type=int, default=42)
     parser.add_argument("--no_eval",      action="store_true", help="Skip before/after eval")
     parser.add_argument("--eval_only",    action="store_true")

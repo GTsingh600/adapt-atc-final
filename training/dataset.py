@@ -262,23 +262,21 @@ OUTPUT FORMAT (strict JSON, no markdown):
 def build_episode_dataset(
     n_episodes: int = 200,
     seed: int = 42,
-    include_generator: bool = True,
-    include_supervisor: bool = True,
+    include_generator: bool = False,
+    include_supervisor: bool = False,
     include_adapt: bool = True,
-    domain_episode_ratio: float = 0.30,
-    long_horizon_ratio: float = 0.25,
+    domain_episode_ratio: float = 0.50,
+    long_horizon_ratio: float = 0.0,
 ) -> List[Dict[str, Any]]:
-    """Build full multi-agent training dataset.
+    """Build ADAPT-focused multi-agent training dataset.
 
-    Returns list of training samples, one per agent turn per episode.
-    Each episode has: 1 AMAN bid + 1 DMAN bid + optionally 1 negotiation round.
-    If include_generator: also 1 generator turn per episode.
-    If include_supervisor: also 1 supervisor turn per episode.
-    If include_adapt: ~30% of episodes are domain-transfer episodes (ICU tasks).
-      Each domain episode emits: 1 ADAPT sample + 1 AMAN sample + 1 DMAN sample
-      on the ADAPT-mapped task (so AMAN/DMAN see correctly-parameterised flights).
-    long_horizon_ratio: fraction of ATC episodes that use cascade mutations to
-      simulate multi-epoch planning pressure (long-horizon Theme #2 training signal).
+    ADAPT is the primary training role (~50% of samples).
+    AMAN + DMAN are support roles (~25% each) that teach JSON format.
+
+    Training mix:
+      - 50% domain-transfer episodes: 1 ADAPT + 1 AMAN + 1 DMAN = 3 samples
+      - 50% regular ATC episodes: 1 AMAN + 1 DMAN = 2 samples
+      - Generator and Supervisor disabled by default
     """
     import random
     rng = random.Random(seed)
@@ -286,7 +284,6 @@ def build_episode_dataset(
     task_list = list(ordered_tasks())
     supervisor = SupervisorAgent()
     env = MultiAgentATCEnvironment(seed=seed)
-    generator = ChallengeGenerator(seed=seed)
 
     # Lazy-import ICU domain to avoid circular dependencies
     domain_tasks: List = []
@@ -302,7 +299,7 @@ def build_episode_dataset(
     samples: List[Dict[str, Any]] = []
 
     for ep_id in range(n_episodes):
-        # ~30% of episodes are domain-transfer (ADAPT) episodes
+        # ~50% of episodes are domain-transfer (ADAPT) episodes
         is_domain_ep = (
             include_adapt
             and bool(domain_tasks)
@@ -360,28 +357,16 @@ def build_episode_dataset(
             ))
             continue
 
+        # Regular ATC episode — use base tasks with domain randomisation
         base_task = rng.choice(task_list)
         profile = supervisor.sample_profile(ep_id)
         sup_desc = SUPERVISOR_PROFILES[profile]["description"]
 
-        # Apply adaptive curriculum mutation
-        mutated_task, is_solvable, adapt_ctx = generator.adapt(base_task)
-
-        # Long-horizon: 25% of ATC episodes get a cascade injection — a Heavy at
-        # the planning boundary forces agents to reason across epoch boundaries.
-        is_long_horizon_ep = rng.random() < long_horizon_ratio
-        if is_long_horizon_ep:
-            try:
-                mutated_task, _, _ = generator.adapt(
-                    base_task, long_horizon=True
-                )
-            except Exception:
-                pass  # fall back to standard mutated task on any error
-
         aman_obs, dman_obs = env.reset(
             episode_id=ep_id,
             supervisor_profile=profile,
-            mutated_task=mutated_task,
+            mutated_task=base_task,
+            randomize=True,  # small perturbations prevent memorisation
         )
 
         atfm_json = json.dumps(env._state.atfm_deadlines)
@@ -391,7 +376,7 @@ def build_episode_dataset(
             ep_id=ep_id,
             obs=aman_obs,
             atfm_json=atfm_json,
-            dman_slots_json="[]",  # no DMAN info yet at bid round
+            dman_slots_json="[]",
             sup_desc=sup_desc,
             profile=profile,
             round_name="bid",
@@ -402,41 +387,11 @@ def build_episode_dataset(
             ep_id=ep_id,
             obs=dman_obs,
             atfm_json=atfm_json,
-            aman_slots_json="[]",  # no AMAN info yet at bid round
+            aman_slots_json="[]",
             sup_desc=sup_desc,
             profile=profile,
             round_name="bid",
         ))
-
-        # Generator sample
-        if include_generator:
-            samples.append(_make_generator_sample(
-                ep_id=ep_id,
-                task=base_task,
-                profile=profile,
-                difficulty_level=generator.difficulty_level,
-                ema_score=generator.ema_score,
-            ))
-
-        # Supervisor sample (uses a dummy merged plan for dataset; real plan used at inference)
-        if include_supervisor:
-            samples.append(_make_supervisor_sample(
-                ep_id=ep_id,
-                task=mutated_task,
-                profile=profile,
-                sup_desc=sup_desc,
-            ))
-
-        # Update adaptive curriculum with simulated skill scores
-        sim_score = rng.uniform(0.25, 0.75)
-        generator.record(
-            task_id=base_task.task_id,
-            skill_scores={d: rng.uniform(0.25, 0.80) for d in [
-                "conflict_avoidance", "delay_efficiency", "emergency_handling",
-                "atfm_compliance", "coverage", "coordination", "fairness",
-            ]},
-            composite=sim_score,
-        )
 
     return samples
 
