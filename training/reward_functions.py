@@ -79,6 +79,15 @@ def _get_catalog() -> Dict[str, TaskDefinition]:
     return _CATALOG
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    """Convert any value to a plain Python float. Never returns a tensor."""
+    try:
+        v = float(value)
+        return v if (v == v) else default  # NaN guard
+    except Exception:
+        return default
+
+
 def _metadata_list(value: Any, length: int, default: Any) -> List[Any]:
     if isinstance(value, list):
         if not value:
@@ -267,8 +276,7 @@ def aman_reward_fn(
 
         aman_action = parse_aman_action(completion)
         if aman_action is None:
-            # Partial credit scaled by format quality
-            rewards.append(round(0.15 * fmt, 4))
+            rewards.append(_safe_float(0.15 * fmt))
             continue
 
         # ── Tier 2: SAFETY ────────────────────────────────────────────────
@@ -324,7 +332,7 @@ def aman_reward_fn(
 
         # ── Compose: format gates → safety gates → quality ────────────────
         reward = format_gate * (0.30 * safety + safety_gate * 0.70 * quality)
-        rewards.append(round(max(0.0, min(1.0, reward)), 4))
+        rewards.append(_safe_float(max(0.0, min(1.0, reward))))
 
     return rewards
 
@@ -372,7 +380,7 @@ def dman_reward_fn(
 
         dman_action = parse_dman_action(completion)
         if dman_action is None:
-            rewards.append(round(0.15 * fmt, 4))
+            rewards.append(_safe_float(0.15 * fmt))
             continue
 
         # ── Tier 2: SAFETY ────────────────────────────────────────────────
@@ -423,7 +431,7 @@ def dman_reward_fn(
 
         # ── Compose ───────────────────────────────────────────────────────
         reward = format_gate * (0.30 * safety + safety_gate * 0.70 * quality)
-        rewards.append(round(max(0.0, min(1.0, reward)), 4))
+        rewards.append(_safe_float(max(0.0, min(1.0, reward))))
 
     return rewards
 
@@ -485,7 +493,7 @@ def adapt_reward_fn(
 
         action = parse_adapt_action(completion)
         if action is None:
-            rewards.append(round(0.10 * fmt, 4))
+            rewards.append(_safe_float(0.10 * fmt))
             continue
 
         has_wake = bool(action.entity_wake_map)
@@ -611,6 +619,6 @@ def adapt_reward_fn(
                 + 0.20 * rat_score
             )
         )
-        rewards.append(round(max(0.0, min(1.0, reward)), 4))
+        rewards.append(_safe_float(max(0.0, min(1.0, reward))))
 
     return rewards

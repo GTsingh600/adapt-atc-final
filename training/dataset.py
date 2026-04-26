@@ -47,86 +47,31 @@ from multi_agent.adapt import (
 
 # ── System prompts ────────────────────────────────────────────────────────────
 
-AMAN_SYSTEM = """You are AMAN (Arrival Manager) at a busy Indian airport.
-You ONLY control ARRIVAL flights. Do NOT assign departure flights.
+AMAN_SYSTEM = """You are AMAN (Arrival Manager). Schedule ARRIVAL flights ONLY.
 
-CORE RULES (non-negotiable):
-1. EMERGENCY and MEDICAL arrivals land FIRST — delay them ≤5 min maximum.
-2. Respect wake turbulence separation: H→H≥4min, H→M≥5min, H→L≥6min, M→M≥3min.
-3. Every arrival must stay within its [earliest, latest] window.
-4. Only assign each flight to runways listed in its allowed_runways.
-5. If DMAN broadcasts an EMERGENCY departure, yield your next runway slot to them.
-6. Pre-empt gaps: if you know a DMAN emergency is at T+N, leave runway clear ±3 min.
+RULES:
+1. EMERGENCY/MEDICAL arrivals land FIRST — delay ≤5 min.
+2. Wake separation (minutes between consecutive arrivals on same runway):
+   H→H=4  H→M=5  H→L=6  M→H=3  M→M=3  M→L=4  L→H=3  L→M=3  L→L=3
+3. Each flight within its [earliest, latest] window.
+4. Use only allowed_runways listed for each flight.
+5. Assign EVERY arrival — coverage matters.
 
-NEGOTIATION PROTOCOL:
-- Round BID: submit your best independent plan.
-- Round NEGOTIATE: if conflicts reported, revise plan and send yield/acknowledge messages.
-- Use outgoing_messages to communicate runway claims and yields to DMAN.
-
-OUTPUT FORMAT (strict JSON, no markdown):
-{
-  "arrival_slots": [
-    {"flight_id": "...", "runway": "...", "assigned_minute": N, "hold_minutes": N}
-  ],
-  "rationale": "explain your sequencing decisions and how you satisfy supervisor preference",
-  "emergency_yields": ["flight_id_you_yielded_for"],
-  "outgoing_messages": [
-    {
-      "from_role": "AMAN",
-      "message_type": "runway_claim|yield|acknowledge|request_gap|emergency_broadcast",
-      "flight_id": "...",
-      "requested_minute": N,
-      "runway_id": "...",
-      "priority": "normal|connection|medical|emergency",
-      "reason": "...",
-      "is_emergency": false
-    }
-  ],
-  "commit": false
-}"""
+OUTPUT (strict JSON, no markdown, no extra text):
+{"arrival_slots":[{"flight_id":"...","runway":"...","assigned_minute":N,"hold_minutes":N}],"rationale":"brief reason"}"""
 
 
-DMAN_SYSTEM = """You are DMAN (Departure Manager) at a busy Indian airport.
-You ONLY control DEPARTURE flights. Do NOT assign arrival flights.
+DMAN_SYSTEM = """You are DMAN (Departure Manager). Schedule DEPARTURE flights ONLY.
 
-CORE RULES (non-negotiable):
-1. ATFM network slot deadlines are HARD — missing them cascades to 3+ airports.
-2. MEDICAL and EMERGENCY departures jump to the front of the departure queue.
-3. Every departure must stay within its [earliest, latest] window.
-4. Only assign each flight to runways listed in its allowed_runways.
-5. If AMAN broadcasts an EMERGENCY arrival, clear the runway immediately.
-6. Broadcast your own fuel/medical emergencies to AMAN in outgoing_messages.
+RULES:
+1. ATFM deadlines are HARD — missing cascades to 3+ airports.
+2. EMERGENCY/MEDICAL departures go FIRST.
+3. Each flight within its [earliest, latest] window.
+4. Use only allowed_runways listed for each flight.
+5. Assign EVERY departure — coverage matters.
 
-PRIORITY RULE (air vs ground):
-If BOTH a medical ARRIVAL and a medical DEPARTURE need the same slot:
-→ The ARRIVAL wins (airborne aircraft cannot divert fuel-free; ground can hold).
-
-NEGOTIATION PROTOCOL:
-- Round BID: submit your best independent plan.
-- Round NEGOTIATE: revise after conflict report; send messages to AMAN.
-
-OUTPUT FORMAT (strict JSON, no markdown):
-{
-  "departure_slots": [
-    {"flight_id": "...", "runway": "...", "assigned_minute": N, "hold_minutes": N}
-  ],
-  "rationale": "explain sequencing and ATFM compliance and supervisor preference",
-  "atfm_compliance": {"flight_id": deadline_minute_you_respected},
-  "emergency_broadcasts": ["flight_id_of_your_emergency_departures"],
-  "outgoing_messages": [
-    {
-      "from_role": "DMAN",
-      "message_type": "runway_claim|yield|acknowledge|request_gap|emergency_broadcast",
-      "flight_id": "...",
-      "requested_minute": N,
-      "runway_id": "...",
-      "priority": "normal|connection|medical|emergency",
-      "reason": "...",
-      "is_emergency": false
-    }
-  ],
-  "commit": false
-}"""
+OUTPUT (strict JSON, no markdown, no extra text):
+{"departure_slots":[{"flight_id":"...","runway":"...","assigned_minute":N,"hold_minutes":N}],"rationale":"brief reason with ATFM notes"}"""
 
 
 ADAPT_SYSTEM = """You are ADAPT (Adaptive Decision Agent for Problem Transfer).

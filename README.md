@@ -26,6 +26,19 @@ tags:
 
 # Shared Runways, Split Intelligence
 
+## ⚡ Quick Start — Colab Notebooks
+
+| GPU | Notebook | dtype | Batch | Time |
+|-----|----------|-------|-------|------|
+| T4 16 GB | [`train_t4.ipynb`](train_t4.ipynb) | **fp16** | 1 × accum 4 | ~2 h (150 eps) |
+| A100 40/80 GB | [`train_a100.ipynb`](train_a100.ipynb) | **bf16** | 4 × accum 2 | ~2–3 h (300 eps) |
+
+**One-click**: Open either notebook in Colab → Runtime → T4/A100 GPU → upload repo zip → Run All.
+
+> **dtype rules (never mix):**
+> - T4 (Turing) → `fp16=True, bf16=False` — T4 has no native bf16 matmul
+> - A100/H100 (Ampere+) → `bf16=True, fp16=False` — better dynamic range than fp16
+
 *Multi-agent reinforcement learning for cooperative air traffic control — with self-adapting curriculum, long-horizon planning, and seven novel loss function components*
 
 ---
@@ -552,28 +565,34 @@ From `constants.py` — enforced on every slot assignment:
 
 ## Training Stack
 
-### Standard Mode (LoRA, Colab T4)
+### T4 Mode (fp16, 16 GB VRAM)
 
 ```python
-Model:       Qwen2.5-7B-Instruct
-Quantization: 4-bit QLoRA  (load_in_4bit=True)
-LoRA rank:   16  (q_proj, v_proj, k_proj, o_proj)
-Batch size:  2,  gradient accumulation 4  → effective batch 8
-Generations: N=4 per prompt  (minimum for stable GRPO advantage variance)
-Max tokens:  512 per completion
-LR:          5e-5
-KL coeff:    0.0  (disabled — avoids ref_per_token_logps crash on Unsloth+PEFT)
-Training:    ~200 episodes ≈ 800 samples ≈ 2 hr on T4
+Model:       Qwen2.5-1.5B-Instruct  (unsloth/Qwen2.5-1.5B-Instruct mirror)
+Quantization: 4-bit QLoRA  load_in_4bit=True
+LoRA rank:   8   (q/k/v/o + gate/up/down — all 7 projections)
+dtype:       float16  ← EXPLICIT — T4 Turing has no native bf16 matmul
+Batch:       1 × grad_accum 4  →  effective batch 4
+Generations: 2  (T4 VRAM limit)
+Completion:  256 tokens
+LR:          5e-6
+KL coeff:    0.0  (avoids ref_per_token_logps=None crash with PEFT)
+Optim:       adamw_8bit  (NOT paged_adamw_8bit — fails on some bnb versions)
+Attn:        sdpa  (flash_attention_2 only used when flash-attn package installed)
+Time:        ~2 h / 150 episodes
+Notebook:    train_t4.ipynb
 ```
 
-### Full-Model Mode (A100/H100)
+### A100 Mode (bf16, 40/80 GB VRAM)
 
 ```python
-Quantization: None  (full precision)
-LR:           5e-6  (10x lower than LoRA)
-LLRD:         0.85  (layer-wise LR decay — early layers learn slower)
-Grad clip:    0.5   (critical for stability without reference model KV)
-KL coeff:     adaptive  (0.001 – 0.10, scales with reward improvement rate)
+dtype:       bfloat16  ← EXPLICIT — A100 Ampere Tensor Core bf16 support
+Batch:       4 × grad_accum 2  →  effective batch 8
+Generations: 4  (stable GRPO advantage variance — N≥4 recommended)
+LoRA rank:   16
+Completion:  512 tokens
+Time:        ~2–3 h / 300 episodes
+Notebook:    train_a100.ipynb
 ```
 
 Layer-wise learning rate decay prevents catastrophic forgetting:
@@ -676,7 +695,12 @@ python training/train_grpo.py --full_model --episodes 500 --output_dir ./outputs
 
 ### Colab Quick Start
 
-Open `training/atc_multiagent_colab.ipynb` — installs Unsloth + TRL, mounts environment, runs 200 training episodes, prints before/after comparison.
+| GPU | Open | dtype |
+|-----|------|-------|
+| T4 16 GB | [`train_t4.ipynb`](train_t4.ipynb) | fp16 |
+| A100 40/80 GB | [`train_a100.ipynb`](train_a100.ipynb) | bf16 |
+
+Each notebook: installs Unsloth + TRL → loads model → builds dataset → trains GRPO → plots reward curve → inference demo. Upload `adapt-atc-final.zip` via Colab Files panel.
 
 ### Evaluate a Trained Checkpoint
 

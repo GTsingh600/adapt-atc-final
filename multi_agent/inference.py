@@ -386,14 +386,20 @@ _PROFILE_LIST = list(SupervisorProfileName)
 def run_episode(
     task_id: str,
     client,
-    env: MultiAgentATCEnvironment,
-    curriculum: Optional[ContextAdaptiveCurriculum],
-    episode_id: int,
-    use_curriculum: bool = True,
+    env: Optional[MultiAgentATCEnvironment] = None,
+    curriculum: Optional[ContextAdaptiveCurriculum] = None,
+    episode_id: int = 0,
+    use_curriculum: bool = False,
     model_name: Optional[str] = None,
     transcript_dir: Optional[Path] = None,
 ) -> Dict:
-    """Run one full AMAN/DMAN episode. Returns result dict for logging."""
+    """Run one full AMAN/DMAN episode. Returns result dict for logging.
+
+    Minimal call:
+        result = run_episode("delhi_monsoon_recovery_easy", client=None)
+    """
+    if env is None:
+        env = MultiAgentATCEnvironment(seed=42)
     catalog  = task_catalog()
     base_task = catalog.get(task_id, list(catalog.values())[0])
     profile   = _PROFILE_LIST[episode_id % len(_PROFILE_LIST)]

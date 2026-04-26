@@ -1,1176 +1,336 @@
-"""ADAPT-Focused Multi-Agent ATC GRPO Training with Unsloth.
+"""ADAPT ATC — GRPO training with Unsloth.
 
-Architecture:
-  - Single LLM plays 3 roles via system prompts: ADAPT (primary), AMAN, DMAN
-  - GRPO: group-relative advantage  A_i = (r_i - mean(group)) / (std(group) + eps)
-  - ADAPT: domain transfer agent — maps unknown domains to ATC parameters
-  - AMAN/DMAN: support roles for JSON format learning and scheduling vocabulary
-  - Simplified 5-component rewards per role for stable convergence
-  - Per-role reward curves saved to reward_curves.json for demo
-
-Training mix:
-  ~50% domain-transfer (ADAPT) episodes — primary training signal
-  ~25% AMAN episodes — JSON format + arrival scheduling
-  ~25% DMAN episodes — JSON format + departure scheduling
+Agents: AMAN (arrivals) · DMAN (departures) · ADAPT (domain transfer)
+All three roles share one LLM differentiated by system prompts.
 
 Usage:
-  python training/train_grpo.py [--episodes 200] [--model Qwen/Qwen2.5-1.5B-Instruct]
-  python training/train_grpo.py --model Qwen/Qwen2.5-7B-Instruct --episodes 300
-
-Colab one-liner (LoRA):
-  !python training/train_grpo.py --episodes 100 --output_dir /content/atc-multiagent
+  python training/train_grpo.py                        # 150 episodes, full dataset
+  python training/train_grpo.py --easy --episodes 80   # AMAN+DMAN only, fast ~1 h
+  python training/train_grpo.py --episodes 300 --n_gen 4  # A100 full run
 """
 
 from __future__ import annotations
 
 import argparse
-import inspect
 import json
 import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from training.dataset import build_episode_dataset
+from training.reward_functions import aman_reward_fn, dman_reward_fn, adapt_reward_fn
+from multi_agent.models import AgentRole
 
-def _require_training_deps():
-    if sys.version_info >= (3, 14):
-        print("[ERROR] Python 3.14 not supported. Use 3.11 or 3.12.")
-        sys.exit(1)
-    try:
-        import torch
-    except ImportError as e:
-        print(f"[ERROR] Training deps missing: {e}")
-        print("Install: pip install torch")
-        sys.exit(1)
-    try:
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        from peft import get_peft_model, LoraConfig
-    except Exception as e:
-        print(f"[ERROR] transformers/peft import failed: {e}")
-        print("Install: pip install transformers peft")
-        sys.exit(1)
-    try:
-        from trl import GRPOConfig, GRPOTrainer
-    except ImportError as e:
-        print(f"[ERROR] Training deps missing: {e}")
-        print("Install: pip install trl")
-        sys.exit(1)
-    return torch, AutoModelForCausalLM, AutoTokenizer, get_peft_model, LoraConfig, GRPOConfig, GRPOTrainer
+# ── Hyperparameters ───────────────────────────────────────────────────────────
+#   T4  (16 GB fp16): episodes=150, n_gen=2, batch=1, accum=4  → ~2 h
+#   A100 (40 GB bf16): episodes=300, n_gen=4, batch=4, accum=2  → ~2–3 h
 
+MODEL      = "unsloth/Qwen2.5-1.5B-Instruct"
+LORA_RANK  = 8        # ~0.4% trainable params — fast convergence for 1.5B
+MAX_SEQ    = 2048     # prompt 1792 + completion 256
+MAX_TOKENS = 256      # completion window
+N_GEN      = 2        # GRPO group size (min 2 for non-degenerate std)
+# IMPORTANT: per_device_train_batch_size MUST be divisible by num_generations.
+# TRL enforces this hard; batch=2, n_gen=2 satisfies the constraint on T4.
+BATCH      = 2        # per-device batch (must be >= N_GEN and divisible by N_GEN)
+ACCUM      = 4        # gradient accumulation → effective batch = 8
+LR         = 5e-6
+EPOCHS     = 3
+WARMUP     = 0.10
 
-from training.dataset import (
-    build_episode_dataset,
-    parse_aman_action,
-    parse_dman_action,
-)
-from training.reward_functions import (
-    aman_reward_fn,
-    dman_reward_fn,
-    adapt_reward_fn,
-)
-from multi_agent.environment import MultiAgentATCEnvironment
-from multi_agent.models import AgentRole, SupervisorProfileName
-from tasks import task_catalog, ordered_tasks
+# ── Reward dispatcher ─────────────────────────────────────────────────────────
 
-
-# ── Hyperparameters — ADAPT-first, 1.5B-optimised ────────────────────────────
-#
-# Tuned for stable convergence on T4/A100 Colab with Qwen2.5-1.5B.
-# ADAPT is the PRIMARY training role (~65% of samples).
-# AMAN/DMAN are support roles for JSON format only (micro tasks, short context).
-#
-# 1.5B memory budget on T4 (16 GB):
-#   4-bit quant: ~900 MB model | LoRA rank=8: ~50 MB | seq_len=1024: ~1.5 GB
-#   Leaves ~13 GB for activations + batch — comfortable at batch=2, accum=4.
-#
-# To run on 7B instead: --lora_rank 16 --episodes 300 (seq_len auto-adjusts)
-
-DEFAULT_MODEL  = "Qwen/Qwen2.5-1.5B-Instruct"
-DEFAULT_OUTPUT = "./outputs/atc-adapt"
-
-# QLoRA config — all 7 projection types
-# rank=8 for 1.5B: ~0.4% trainable params, fast convergence on simple structure task
-# rank=16 for 7B:  --lora_rank 16
-LORA_RANK    = 8
-LORA_ALPHA   = 16   # 2x rank
-LORA_TARGETS = [
-    "q_proj", "v_proj", "k_proj", "o_proj",   # attention
-    "gate_proj", "up_proj", "down_proj",       # FFN / MLP
-]
-
-MAX_SEQ_LEN    = 2560   # prompt ~1700 + completion 384 = 2084; 2560 gives safe headroom
-MAX_NEW_TOKENS = 384    # AMAN/DMAN JSON with 3 slots + rationale + messages = ~280 tokens
-                        # 192 was too short → 95% clipped → parse-fail → reward_std=0
-TEMPERATURE    = 0.8    # exploration for GRPO group diversity
-N_GENERATIONS  = 2      # T4 practical max
-BATCH_SIZE     = 2
-GRAD_ACCUM     = 4      # effective batch = 8 — faster iteration vs 16
-LR             = 5e-6   # low LR prevents reward collapse
-KL_COEFF       = 0.0    # keep 0.0 — non-zero KL crashes Unsloth+PEFT
-WARMUP_RATIO   = 0.10   # longer warmup for early gradient stability
-SAVE_STEPS     = 50
-SAVE_TOTAL_LIMIT = 3
-
-
-# ── Role-dispatch table (ADAPT-focused: only 3 roles) ────────────────────────
-
-REWARD_FN_DISPATCH = {
+_DISPATCH: Dict[str, Any] = {
     AgentRole.AMAN.value:  aman_reward_fn,
     AgentRole.DMAN.value:  dman_reward_fn,
-    AgentRole.ADAPT.value: adapt_reward_fn,   # primary training role
+    AgentRole.ADAPT.value: adapt_reward_fn,
 }
 
 
-def _reward_failure_mode() -> str:
-    mode = os.getenv("REWARD_FAILURE_MODE", "strict").strip().lower()
-    return mode if mode in {"strict", "penalize"} else "strict"
+def _partial(text: str, role: str) -> float:
+    """Partial credit when JSON parse fails — keeps reward_std > 0 during cold start."""
+    s = 0.05
+    if "{" in text: s += 0.03
+    if role == "AMAN"  and "arrival_slots"   in text: s += 0.06
+    if role == "DMAN"  and "departure_slots" in text: s += 0.06
+    if role == "ADAPT" and "entity_wake_map" in text: s += 0.06
+    if '"flight_id"' in text: s += 0.04
+    if "rationale"    in text: s += 0.02
+    return min(s, 0.22)
 
 
-def _config_supports(param: str, config_cls) -> bool:
-    try:
-        return param in inspect.signature(config_cls.__init__).parameters
-    except Exception:
-        return False
+def reward_fn(completions: List, **kwargs) -> List[float]:
+    """Route each completion to its role-specific composable rubric.
 
-
-def _trainer_supports(param: str, trainer_cls) -> bool:
-    try:
-        return param in inspect.signature(trainer_cls.__init__).parameters
-    except Exception:
-        return False
-
-
-def _maybe_patch_trainer_sampler(trainer) -> None:
-    """Handle TRL/Transformers sampler signature drift across versions."""
-    try:
-        sampler = getattr(type(trainer), "_get_train_sampler", None)
-        if sampler is None:
-            return
-        # Old TRL versions expose _get_train_sampler(self) while newer
-        # Transformers call sampler_fn(dataset). Patch only that old form.
-        if len(inspect.signature(sampler).parameters) == 1:
-            from types import MethodType
-
-            original = trainer._get_train_sampler
-
-            def _compat_get_train_sampler(self, train_dataset=None):
-                return original()
-
-            trainer._get_train_sampler = MethodType(_compat_get_train_sampler, trainer)
-            print("[WARN] Applied sampler compatibility shim for this TRL/Transformers pair.")
-    except Exception as exc:
-        print(f"[WARN] Could not apply sampler compatibility shim: {exc}")
-
-
-def _maybe_patch_unsloth_grad_accum(trainer) -> None:
-    """Provide missing attribute expected by some Unsloth GRPO trainer builds."""
-    if hasattr(trainer, "current_gradient_accumulation_steps"):
-        return
-    steps = 1
-    try:
-        args = getattr(trainer, "args", None)
-        if args is not None:
-            steps = int(getattr(args, "gradient_accumulation_steps", 1) or 1)
-    except Exception:
-        steps = 1
-    trainer.current_gradient_accumulation_steps = steps
-    print(
-        "[WARN] Applied Unsloth GRPO compatibility shim: "
-        f"current_gradient_accumulation_steps={steps}"
-    )
-
-
-def _maybe_patch_unsloth_loss_type(trainer) -> None:
-    """Ensure loss_type exists for Unsloth/TRL compatibility.
-
-    Some compiled trainer paths branch on hasattr(self.args, "loss_type").
-    If missing, they may take an older unpack path that mismatches newer
-    return signatures and crashes with "too many values to unpack".
+    Returns List[float] in [0, 1] — guaranteed plain Python floats, never tensors.
+    TRL GRPOTrainer calls this after generating num_generations completions per prompt.
     """
-    try:
-        args = getattr(trainer, "args", None)
-        if args is None:
-            return
-        if getattr(args, "loss_type", None) is None:
-            setattr(args, "loss_type", "grpo")
-            print("[WARN] Applied Unsloth GRPO compatibility shim: loss_type='grpo'")
-    except Exception as exc:
-        print(f"[WARN] Could not apply loss_type compatibility shim: {exc}")
-
-
-def _maybe_patch_unsloth_runtime_attrs(trainer) -> None:
-    """Backfill runtime attrs expected by some Unsloth compiled trainer builds."""
-    try:
-        args = getattr(trainer, "args", None)
-
-        if not hasattr(trainer, "importance_sampling_level"):
-            level = "token"
-            if args is not None:
-                level = getattr(args, "importance_sampling_level", level) or level
-            setattr(trainer, "importance_sampling_level", level)
-            print(
-                "[WARN] Applied Unsloth GRPO compatibility shim: "
-                f"importance_sampling_level={level!r}"
-            )
-
-        if not hasattr(trainer, "epsilon_low"):
-            epsilon_low = 0.2
-            if args is not None:
-                epsilon_low = float(getattr(args, "epsilon", epsilon_low) or epsilon_low)
-            setattr(trainer, "epsilon_low", epsilon_low)
-            print(
-                "[WARN] Applied Unsloth GRPO compatibility shim: "
-                f"epsilon_low={epsilon_low}"
-            )
-
-        if not hasattr(trainer, "epsilon_high"):
-            epsilon_high = getattr(trainer, "epsilon_low", 0.2)
-            if args is not None:
-                epsilon_high = float(
-                    getattr(args, "epsilon_high", epsilon_high) or epsilon_high
-                )
-            setattr(trainer, "epsilon_high", epsilon_high)
-            print(
-                "[WARN] Applied Unsloth GRPO compatibility shim: "
-                f"epsilon_high={epsilon_high}"
-            )
-
-        if not hasattr(trainer, "vllm_importance_sampling_cap"):
-            cap = 2.0
-            if args is not None:
-                cap = float(
-                    getattr(args, "vllm_importance_sampling_cap", cap) or cap
-                )
-            setattr(trainer, "vllm_importance_sampling_cap", cap)
-            print(
-                "[WARN] Applied Unsloth GRPO compatibility shim: "
-                f"vllm_importance_sampling_cap={cap}"
-            )
-
-        if not hasattr(trainer, "loss_type"):
-            loss_type = "grpo"
-            if args is not None:
-                loss_type = getattr(args, "loss_type", loss_type) or loss_type
-            setattr(trainer, "loss_type", loss_type)
-            print(
-                "[WARN] Applied Unsloth GRPO compatibility shim: "
-                f"loss_type={loss_type!r}"
-            )
-    except Exception as exc:
-        print(f"[WARN] Could not apply runtime attr compatibility shim: {exc}")
-
-
-def _maybe_patch_unsloth_args_attrs(trainer) -> None:
-    """Backfill args fields expected by some Unsloth compiled trainer paths."""
-    try:
-        args = getattr(trainer, "args", None)
-        if args is None:
-            return
-
-        if not hasattr(args, "delta"):
-            setattr(args, "delta", None)
-            print("[WARN] Applied Unsloth GRPO compatibility shim: args.delta=None")
-
-        if not hasattr(args, "temperature"):
-            setattr(args, "temperature", TEMPERATURE)
-            print(
-                "[WARN] Applied Unsloth GRPO compatibility shim: "
-                f"args.temperature={TEMPERATURE}"
-            )
-
-        if not hasattr(args, "max_completion_length"):
-            setattr(args, "max_completion_length", MAX_NEW_TOKENS)
-            print(
-                "[WARN] Applied Unsloth GRPO compatibility shim: "
-                f"args.max_completion_length={MAX_NEW_TOKENS}"
-            )
-    except Exception as exc:
-        print(f"[WARN] Could not apply args attr compatibility shim: {exc}")
-
-
-def _maybe_patch_nanmin_symbols() -> None:
-    """Provide nanmin/nanmax symbols expected by some generated trainer code."""
-    try:
-        import builtins
-        import torch as _torch
-
-        def _compat_nanmin(x, *args, **kwargs):
-            if hasattr(_torch, "nanmin"):
-                return _torch.nanmin(x, *args, **kwargs)
-            x2 = _torch.nan_to_num(x, nan=float("inf"))
-            if args or kwargs:
-                return _torch.amin(x2, *args, **kwargs)
-            return _torch.min(x2)
-
-        def _compat_nanmax(x, *args, **kwargs):
-            if hasattr(_torch, "nanmax"):
-                return _torch.nanmax(x, *args, **kwargs)
-            x2 = _torch.nan_to_num(x, nan=float("-inf"))
-            if args or kwargs:
-                return _torch.amax(x2, *args, **kwargs)
-            return _torch.max(x2)
-
-        if not hasattr(builtins, "nanmin"):
-            builtins.nanmin = _compat_nanmin
-            print("[WARN] Applied compatibility shim: builtins.nanmin")
-        if not hasattr(builtins, "nanmax"):
-            builtins.nanmax = _compat_nanmax
-            print("[WARN] Applied compatibility shim: builtins.nanmax")
-    except Exception as exc:
-        print(f"[WARN] Could not apply nanmin/nanmax compatibility shim: {exc}")
-
-
-def _resolve_num_generations(batch_size: int, requested: int) -> int:
-    requested = max(1, requested)
-    for candidate in range(min(requested, batch_size), 0, -1):
-        if batch_size % candidate == 0:
-            return candidate
-    return 1
-
-
-def _effective_kl_coeff() -> float:
-    raw = os.getenv("ATC_KL_COEFF", str(KL_COEFF)).strip()
-    try:
-        value = float(raw)
-    except ValueError:
-        print(f"[WARN] Invalid ATC_KL_COEFF={raw!r}; using default {KL_COEFF}.")
-        return KL_COEFF
-
-    if value < 0.0:
-        print(f"[WARN] Negative KL coeff {value} is invalid; clamping to 0.0.")
-        value = 0.0
-
-    if value > 0.0:
-        print(
-            "[WARN] Non-zero KL enabled. On trl==0.16.0 + unsloth==2026.4.7 this may "
-            "trigger ref_per_token_logps=None errors with PEFT."
-        )
-    return value
-
-
-def _select_sample_value(value: Any, index: int) -> Any:
-    if isinstance(value, list):
-        if not value:
-            return None
-        return value[index] if index < len(value) else value[-1]
-    return value
-
-
-# ── Partial credit helpers ────────────────────────────────────────────────────
-# When the main reward function returns 0 (parse fail / truncated JSON),
-# these give VARIABLE partial credit so GRPO sees non-zero reward std.
-# Without variance, GRPO advantage = 0 → zero gradient for that role.
-
-def _aman_partial_credit(completion: str) -> float:
-    """Variable partial credit for AMAN — counts valid slot structures."""
-    import re as _re
-    text = str(completion).strip()
-    s = 0.0
-    if text.startswith("{"):            s += 0.04
-    if '"arrival_slots"' in text:      s += 0.08
-    # each parseable flight_id+runway pair = 1 valid slot attempt
-    n = len(_re.findall(r'"flight_id"\s*:\s*"[A-Z0-9]+', text))
-    s += min(n * 0.07, 0.35)
-    if '"rationale"' in text:          s += 0.04
-    if text.rstrip().endswith("}"):    s += 0.04
-    return round(min(s, 0.55), 4)
-
-
-def _dman_partial_credit(completion: str) -> float:
-    """Variable partial credit for DMAN — counts valid slot structures."""
-    import re as _re
-    text = str(completion).strip()
-    s = 0.0
-    if text.startswith("{"):            s += 0.04
-    if '"departure_slots"' in text:    s += 0.08
-    n = len(_re.findall(r'"flight_id"\s*:\s*"[A-Z0-9]+', text))
-    s += min(n * 0.07, 0.35)
-    if '"rationale"' in text:          s += 0.04
-    if text.rstrip().endswith("}"):    s += 0.04
-    return round(min(s, 0.55), 4)
-
-
-def _format_exploration_bonus(completion: str) -> float:
-    """Micro-bonus for JSON structure — breaks reward_std=0 cold-start."""
-    import re as _re
-    text = str(completion).strip()
-    n_json = len(_re.findall(r'[{}"\[\]:]', text))
-    bonus = min(n_json * 0.003, 0.08)
-    if text.startswith("{"):  bonus += 0.01
-    if "}" in text:           bonus += 0.01
-    return round(min(bonus, 0.10), 4)
-
-
-# ── Unified reward dispatcher ─────────────────────────────────────────────────
-
-def combined_reward_fn(completions: List[str], **kwargs) -> List[float]:
-    """Route each completion to its role-specific reward function.
-
-    TRL GRPOTrainer calls this with a batch of completions.
-    kwargs contains per-sample metadata from the dataset.
-    """
-    roles = kwargs.get("agent_role", [AgentRole.AMAN.value] * len(completions))
+    n     = len(completions)
+    roles = kwargs.get("agent_role", ["AMAN"] * n)
     if not isinstance(roles, list):
-        roles = [roles] * len(completions)
-    elif len(roles) < len(completions):
-        roles = roles + [roles[-1] if roles else AgentRole.AMAN.value] * (
-            len(completions) - len(roles)
-        )
+        roles = [roles] * n
+    while len(roles) < n:
+        roles.append(roles[-1])
 
     rewards: List[float] = []
-    failure_mode = _reward_failure_mode()
+    for i, (comp, role) in enumerate(zip(completions, roles)):
+        # TRL may pass completion as list-of-dicts (conversational format)
+        if isinstance(comp, list):
+            comp = comp[-1].get("content", "") if comp else ""
+        comp = str(comp)
 
-    for i, (completion, role) in enumerate(zip(completions, roles)):
-        fn = REWARD_FN_DISPATCH.get(role, aman_reward_fn)
-        sample_kwargs = {k: [_select_sample_value(v, i)] for k, v in kwargs.items()}
-        try:
-            r = fn([completion], **sample_kwargs)
-            if not r:
-                raise RuntimeError(f"empty reward list for role={role}")
-            base_r = r[0]
-        except Exception as exc:
-            msg = f"reward_fn({role}) failed at index={i}: {exc}"
-            if failure_mode == "strict":
-                raise RuntimeError(msg) from exc
-            print(f"[WARN] {msg}")
-            base_r = -1.0
+        fn = _DISPATCH.get(str(role), aman_reward_fn)
 
-        # When AMAN/DMAN parse completely fails (base_r ≤ 0), substitute
-        # partial credit so GRPO sees non-zero reward variance across the
-        # group.  Without variance, reward_std=0 → zero advantage → no
-        # gradient for that role.  Partial credit is capped at 0.55 so the
-        # full reward (0.4-0.9) still dominates once the model learns JSON.
-        if base_r <= 0.0:
-            if role == AgentRole.AMAN.value:
-                base_r = _aman_partial_credit(completion)
-            elif role == AgentRole.DMAN.value:
-                base_r = _dman_partial_credit(completion)
+        # Slice kwargs to a single-item list (reward fns expect List[...])
+        kw = {}
+        for k, v in kwargs.items():
+            if k == "agent_role":
+                continue
+            if isinstance(v, list):
+                kw[k] = [v[i] if i < len(v) else (v[-1] if v else "")]
             else:
-                base_r = _format_exploration_bonus(completion)
+                kw[k] = [v]
 
-        rewards.append(round(base_r, 5))
+        try:
+            r      = fn([comp], **kw)
+            reward = float(r[0]) if r else _partial(comp, str(role))
+            reward = max(0.0, min(1.0, reward))
+            if reward != reward:   # NaN guard
+                reward = _partial(comp, str(role))
+        except Exception:
+            reward = _partial(comp, str(role))
+
+        rewards.append(float(reward))
 
     return rewards
 
 
-# ── Training entry point ──────────────────────────────────────────────────────
+# ── Training ──────────────────────────────────────────────────────────────────
 
 def train(
-    model_name:   str  = DEFAULT_MODEL,
-    output_dir:   str  = DEFAULT_OUTPUT,
-    n_episodes:   int  = 200,
-    lora_rank:    int  = LORA_RANK,
-    seed:         int  = 42,
-    push_to_hub:  bool = False,
-    hub_model_id: Optional[str] = None,
-    run_eval:     bool = True,
+    model_name: str  = MODEL,
+    output_dir: str  = "./outputs/atc-grpo",
+    n_episodes: int  = 150,
+    lora_rank:  int  = LORA_RANK,
+    easy:       bool = False,
+    n_gen:      int  = N_GEN,
 ) -> None:
-    torch, AutoModelForCausalLM, AutoTokenizer, get_peft_model, LoraConfig, GRPOConfig, GRPOTrainer = _require_training_deps()
+    """Run GRPO training.
 
-    num_generations = _resolve_num_generations(BATCH_SIZE, N_GENERATIONS)
-    if num_generations != N_GENERATIONS:
-        print(
-            f"[WARN] Adjusted num_generations {N_GENERATIONS} -> {num_generations} "
-            f"to satisfy GRPO batch-size divisibility constraint."
-        )
+    Args:
+        easy: When True, trains AMAN+DMAN only (no ADAPT domain transfer).
+              Converges faster — good for a first run or quick hackathon demo.
+        n_gen: Generations per prompt. T4 → 2, A100 → 4.
+    """
+    import torch
+    try:
+        from unsloth import FastLanguageModel, PatchFastRL
+    except ImportError:
+        raise ImportError("pip install unsloth")
+    from trl import GRPOConfig, GRPOTrainer
+    from datasets import Dataset
 
-    device_str = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
-    print(f"\n{'='*60}")
-    print(f"  ATC Multi-Agent GRPO Training")
-    print(f"  Model:         {model_name}")
-    print(f"  Mode:          QLoRA rank={lora_rank} (all 7 projection types)")
-    print(f"  Focus:         ADAPT domain transfer (~50% of samples)")
-    print(f"  Episodes:      {n_episodes}")
-    print(f"  Generations:   {num_generations} per prompt")
-    print(f"  LR:            {LR}")
-    print(f"  Output:        {output_dir}")
-    print(f"  Device:        {device_str}")
-    print(f"{'='*60}\n")
+    # ── Patch GRPO generation hooks before model load ─────────────────────────
+    try:
+        PatchFastRL("GRPO", FastLanguageModel)
+        print("[ok] PatchFastRL")
+    except Exception as e:
+        print(f"[note] PatchFastRL: {e}")
 
-    # ── 1. Capture pre-training baseline metrics ──────────────────────────────
-    if run_eval:
-        print("[0/5] Capturing pre-training baseline metrics...")
-        baseline = _quick_heuristic_eval(n_episodes=min(10, n_episodes))
-        _save_json(baseline, Path(output_dir) / "baseline_metrics.json")
-        print(f"    Baseline composite: {baseline['mean_composite']:.3f}")
+    IS_BF16 = torch.cuda.is_bf16_supported()
+    gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
 
-    # ── 2. Load model — 4-bit QLoRA, all 7 projection types ─────────────────
-    # Targeting q/k/v/o + gate/up/down covers ~85% of transformer params.
-    # This is the maximum expressiveness achievable inside Unsloth's stable
-    # compiled GRPO path — raw full-model (no PEFT) crashes torch._dynamo.
-    print(f"[1/5] Loading model with Unsloth 4-bit QLoRA (rank={lora_rank}, all projections)...")
+    print(f"\n{'='*54}")
+    print(f"  ADAPT ATC GRPO Training")
+    print(f"  model    : {model_name}")
+    print(f"  gpu      : {gpu_name}")
+    print(f"  dtype    : {'bf16 (A100)' if IS_BF16 else 'fp16 (T4)'}")
+    print(f"  episodes : {n_episodes}  easy={easy}")
+    print(f"  n_gen    : {n_gen}")
+    print(f"  output   : {output_dir}")
+    print(f"{'='*54}\n")
 
-    # Validate checkpoint — if it's a directory, it must contain HF weight files.
-    # save_pretrained_merged("merged_4bit_forced") produces GGUF, not HF format.
-    # Fall back to base model so training is never blocked by a bad SFT save.
-    _load_name = model_name
-    if os.path.isdir(model_name):
-        _weight_files = [
-            "model.safetensors",
-            "pytorch_model.bin",
-            "model.safetensors.index.json",
-            "pytorch_model.bin.index.json",
-        ]
-        _has_weights = any(
-            os.path.exists(os.path.join(model_name, f)) for f in _weight_files
-        )
-        if not _has_weights:
-            print(
-                f"  [WARN] {model_name} has no HF weight files "
-                f"(SFT save may have used GGUF format). "
-                f"Falling back to base model: {DEFAULT_MODEL}"
-            )
-            _load_name = DEFAULT_MODEL
-        else:
-            # Strip stale PEFT config so get_peft_model can apply fresh LoRA
-            for _stale in ["adapter_config.json", "adapter_model.safetensors", "adapter_model.bin"]:
-                _p = os.path.join(model_name, _stale)
-                if os.path.exists(_p):
-                    os.remove(_p)
-                    print(f"  [INFO] Stripped stale {_stale} from SFT checkpoint")
-
-    # Explicit dtype prevents FlashAttention "only supports fp16/bf16" crash
-    # when dtype=None auto-detects float32 on some GPU/driver combos.
-    _dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    print(f"  Loading with dtype={'bfloat16' if _dtype == torch.bfloat16 else 'float16'}")
-
-    tokenizer = AutoTokenizer.from_pretrained(_load_name)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    model = AutoModelForCausalLM.from_pretrained(
-        _load_name,
-        torch_dtype=_dtype,
-        device_map="auto",
-        attn_implementation="flash_attention_2" if _dtype == torch.bfloat16 else "sdpa",
+    # ── Load model — 4-bit QLoRA via Unsloth ─────────────────────────────────
+    print("Loading model...")
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=model_name,
+        max_seq_length=MAX_SEQ,
+        load_in_4bit=True,
+        dtype=None,             # auto-detect: fp16 on T4, bf16 on A100
+        trust_remote_code=True,
     )
-    
-    peft_config = LoraConfig(
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token    = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    # ── LoRA ─────────────────────────────────────────────────────────────────
+    model = FastLanguageModel.get_peft_model(
+        model,
         r=lora_rank,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                        "gate_proj", "up_proj", "down_proj"],
         lora_alpha=lora_rank * 2,
-        target_modules=LORA_TARGETS,
         lora_dropout=0.0,
         bias="none",
-        task_type="CAUSAL_LM",
+        use_gradient_checkpointing="unsloth",   # Unsloth memory-efficient variant
+        random_state=42,
     )
-    model = get_peft_model(model, peft_config)
-    
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total     = sum(p.numel() for p in model.parameters())
-    pct       = 100.0 * trainable / max(1, total)
-    print(f"    rank={lora_rank}, targets=7 projections, trainable={trainable:,} ({pct:.1f}%)")
+    tr = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    to = sum(p.numel() for p in model.parameters())
+    print(f"[ok] LoRA rank={lora_rank}: {tr:,}/{to:,} trainable ({100*tr/to:.2f}%)\n")
 
-    # ── 2b. Base model eval (before any gradient steps) ──────────────────────
-    base_model_metrics: Optional[Dict[str, Any]] = None
-    if run_eval:
-        print("\n[1.5/5] Measuring base model score (untrained LoRA)...")
-        model.eval()
-        base_model_metrics = _run_model_episodes(
-            model, tokenizer, n_episodes=3, tag="BASE MODEL (no fine-tune)"
-        )
-        model.train()
-        _save_json(base_model_metrics, Path(output_dir) / "base_model_metrics.json")
-        print(f"    Base model composite: {base_model_metrics['mean_composite']:.3f}"
-              f"  (AMAN {base_model_metrics['mean_aman_reward']:.3f}"
-              f" / DMAN {base_model_metrics['mean_dman_reward']:.3f})")
-
-    # ── 3. Build ADAPT-focused training dataset ────────────────────────────────
-    print(f"\n[2/5] Building {n_episodes}-episode ADAPT-first dataset...")
-    print(f"      domain_episode_ratio=0.65  |  3 roles: ADAPT + AMAN + DMAN")
-    t0 = time.time()
-    dataset_raw = build_episode_dataset(
+    # ── Dataset ───────────────────────────────────────────────────────────────
+    print(f"Building dataset ({n_episodes} episodes, easy={easy})...")
+    raw = build_episode_dataset(
         n_episodes=n_episodes,
-        seed=seed,
-        include_adapt=True,
+        seed=42,
+        include_adapt=not easy,
         domain_episode_ratio=0.65,
         long_horizon_ratio=0.0,
     )
-    print(f"    Dataset: {len(dataset_raw)} samples ({time.time()-t0:.1f}s)")
+    dataset = Dataset.from_list(raw)
 
-    role_counts: Dict[str, int] = {}
-    for s in dataset_raw:
-        r = s.get("agent_role", "unknown")
-        role_counts[r] = role_counts.get(r, 0) + 1
-    for role, count in sorted(role_counts.items()):
-        print(f"    {role}: {count} samples")
+    from collections import Counter
+    counts = Counter(s["agent_role"] for s in raw)
+    for role, cnt in sorted(counts.items()):
+        print(f"  {role:6s}: {cnt}")
+    print(f"  total : {len(dataset)}\n")
 
-    try:
-        from datasets import Dataset
-        dataset = Dataset.from_list(dataset_raw)
-    except ImportError:
-        print("[ERROR] pip install datasets")
-        sys.exit(1)
+    # ── GRPO config ───────────────────────────────────────────────────────────
+    # TRL hard requirement: per_device_train_batch_size % num_generations == 0
+    # Compute the smallest batch_size >= N_GEN that satisfies divisibility.
+    import inspect as _inspect
+    batch_actual = max(BATCH, n_gen)
+    if batch_actual % n_gen != 0:
+        batch_actual = n_gen   # fallback: exactly one group per step
 
-    # ── 4. GRPO config ────────────────────────────────────────────────────────
-    kl_coeff = _effective_kl_coeff()
-    _n_epochs = 4   # 4 epochs: more gradient steps, all 3 roles converge
-    print(
-        f"\n[3/5] Configuring GRPO (group_size={num_generations}, lr={LR}, "
-        f"kl={kl_coeff}, epochs={_n_epochs})..."
-    )
-    grpo_kwargs: Dict[str, Any] = {
-        "num_generations":              num_generations,
-        "temperature":                  TEMPERATURE,
+    grpo_fields = _inspect.signature(GRPOConfig.__init__).parameters
+
+    cfg_kwargs: Dict[str, Any] = {
+        # Generation
+        "num_generations":              n_gen,
+        "max_completion_length":        MAX_TOKENS,
+
+        # Optimisation
         "learning_rate":                LR,
-        "per_device_train_batch_size":  BATCH_SIZE,
-        "gradient_accumulation_steps":  GRAD_ACCUM,
-        "num_train_epochs":             _n_epochs,
-        "warmup_steps":                 int(_n_epochs * (len(dataset) // BATCH_SIZE) * WARMUP_RATIO) if WARMUP_RATIO > 0 else 0,
-        "logging_steps":                10,
-        "save_steps":                   SAVE_STEPS,
-        "save_total_limit":             SAVE_TOTAL_LIMIT,
-        "output_dir":                   output_dir,
-        "run_name":                     f"atc-multiagent-grpo-{int(time.time())}",
-        "bf16":                         next(model.parameters()).dtype == torch.bfloat16,
-        "fp16":                         next(model.parameters()).dtype != torch.bfloat16,
-        "gradient_checkpointing":       True,
-        "optim":                        "paged_adamw_8bit",
+        "per_device_train_batch_size":  batch_actual,
+        "gradient_accumulation_steps":  ACCUM,
+        "num_train_epochs":             EPOCHS,
+        "warmup_ratio":                 WARMUP,
+        "max_grad_norm":                1.0,
+
+        # Precision — explicit, never auto-detect
+        "bf16":  IS_BF16,          # A100 (Ampere) → bf16
+        "fp16":  not IS_BF16,      # T4  (Turing)  → fp16
+
+        # Memory
+        "optim":                 "adamw_8bit",
+        "gradient_checkpointing": True,
+
+        # KL — 0.0 avoids ref_per_token_logps=None crash with PEFT
+        "beta":  0.0,
+
+        # Logging
+        "output_dir":       output_dir,
+        "logging_steps":    1,
+        "save_steps":       50,
+        "save_total_limit": 2,
+        "report_to":        "none",
+        "seed":             42,
     }
 
-    if _wandb_available():
-        grpo_kwargs["report_to"] = "wandb"
-    else:
-        grpo_kwargs["report_to"] = "none"
+    # max_prompt_length: present in TRL >= 0.15
+    if "max_prompt_length" in grpo_fields:
+        cfg_kwargs["max_prompt_length"] = MAX_SEQ - MAX_TOKENS
 
-    # Compatibility shims for different TRL versions
-    if _config_supports("max_completion_length", GRPOConfig):
-        grpo_kwargs["max_completion_length"] = MAX_NEW_TOKENS
-    elif _config_supports("max_new_tokens", GRPOConfig):
-        grpo_kwargs["max_new_tokens"] = MAX_NEW_TOKENS
+    config = GRPOConfig(**cfg_kwargs)
+    print(f"[ok] batch={batch_actual}  n_gen={n_gen}  accum={ACCUM}  "
+          f"dtype={'bf16' if IS_BF16 else 'fp16'}\n")
 
-    if _config_supports("beta", GRPOConfig):
-        grpo_kwargs["beta"] = kl_coeff
-    elif _config_supports("kl_coeff", GRPOConfig):
-        grpo_kwargs["kl_coeff"] = kl_coeff
+    # ── Train ─────────────────────────────────────────────────────────────────
+    os.makedirs(output_dir, exist_ok=True)
 
-    if _config_supports("use_vllm", GRPOConfig):
-        grpo_kwargs["use_vllm"] = False
-
-    grpo_config = GRPOConfig(**grpo_kwargs)
-
-    # ── 5. Per-role reward logger ─────────────────────────────────────────────
-    print("\n[4/5] Setting up per-role reward logging...")
-
-    # Separate lists so we can show per-role curves in the demo
-    reward_log: Dict[str, List[float]] = {
-        "ADAPT": [], "AMAN": [], "DMAN": [], "composite": []
-    }
-
-    class RewardLogger:
-        __name__ = "combined_reward_fn"
-
-        def __call__(self, *args, **kwargs):
-            # TRL <0.17: reward_func(completions=..., **kwargs)
-            # TRL >=0.17: reward_func(prompts, completions, **kwargs)
-            if "completions" in kwargs:
-                completions = kwargs.pop("completions")
-            elif len(args) >= 2:
-                completions = args[1]
-            elif args:
-                completions = args[0]
-            else:
-                completions = []
-            kwargs.pop("prompts", None)
-            kwargs.pop("prompt_ids", None)
-
-            # Some TRL versions pass conversational turns. Extract the assistant text.
-            if completions and isinstance(completions[0], list):
-                flattened = []
-                for c in completions:
-                    if c and isinstance(c[-1], dict) and "content" in c[-1]:
-                        flattened.append(c[-1]["content"])
-                    else:
-                        flattened.append(str(c))
-                completions = flattened
-
-            rewards = combined_reward_fn(completions, **kwargs)
-
-            roles = kwargs.get("agent_role", [])
-            if not isinstance(roles, list):
-                roles = [roles] * len(rewards)
-            elif len(roles) < len(rewards):
-                roles = roles + [
-                    roles[-1] if roles else AgentRole.AMAN.value
-                ] * (len(rewards) - len(roles))
-
-            for r, role in zip(rewards, roles):
-                if role in reward_log:
-                    reward_log[role].append(r)
-                reward_log["composite"].append(r)
-
-            # ── Parseable log line every 20 reward calls ──────────────────
-            # Notebook parses [ATC_REWARD step=N] lines for live display.
-            call_count = len(reward_log["composite"])
-            if call_count % 20 == 0 and call_count > 0:
-                tail = 10
-                role_parts = []
-                for _role in ("ADAPT", "AMAN", "DMAN"):
-                    rs = reward_log.get(_role, [])
-                    if rs:
-                        mean_r = sum(rs[-tail:]) / min(tail, len(rs))
-                        role_parts.append(f"{_role}={mean_r:.4f}")
-                comp = reward_log["composite"]
-                comp_mean = sum(comp[-tail:]) / min(tail, len(comp)) if comp else 0.0
-                role_parts.append(f"composite={comp_mean:.4f}")
-                print(f"[ATC_REWARD step={call_count}] {' '.join(role_parts)}", flush=True)
-
-            # Reward-hacking detection: warn when composite rises but per-role variance
-            # collapses (all roles getting same score = likely gaming)
-            if call_count % 50 == 0 and call_count > 50:
-                _check_reward_hacking(reward_log)
-
-            return rewards
-
-    reward_logger = RewardLogger()
-
-    # ── 6. Train ──────────────────────────────────────────────────────────────
-    print("\n[5/5] Starting GRPO training...")
+    # GRPOTrainer API changed across TRL versions:
+    #   TRL < 0.17:  tokenizer=..., config=...
+    #   TRL >= 0.17: processing_class=..., args=...
+    trainer_sig = _inspect.signature(GRPOTrainer.__init__).parameters
     trainer_kwargs: Dict[str, Any] = {
-        "model":            model,
-        "processing_class": tokenizer,
-        "reward_funcs":     [reward_logger],
-        "train_dataset":    dataset,
+        "model":          model,
+        "reward_funcs":   [reward_fn],
+        "train_dataset":  dataset,
     }
-    if _trainer_supports("args", GRPOTrainer):
-        trainer_kwargs["args"] = grpo_config
+    if "processing_class" in trainer_sig:
+        trainer_kwargs["processing_class"] = tokenizer
+        trainer_kwargs["args"]             = config
     else:
-        trainer_kwargs["config"] = grpo_config
+        trainer_kwargs["tokenizer"] = tokenizer
+        trainer_kwargs["config" if "config" in trainer_sig else "args"] = config
 
     trainer = GRPOTrainer(**trainer_kwargs)
+
+    print("Training...\n")
+    t0 = time.time()
     trainer.train()
+    elapsed = time.time() - t0
 
     # ── Save ──────────────────────────────────────────────────────────────────
-    print(f"\nSaving model to {output_dir}...")
     trainer.save_model(output_dir)
     tokenizer.save_pretrained(output_dir)
-
-    curves_path = Path(output_dir) / "reward_curves.json"
-    _save_json(reward_log, curves_path)
-    print(f"Reward curves -> {curves_path}")
-
-    _print_final_stats(reward_log)
-
-    # ── Post-training eval ────────────────────────────────────────────────────
-    if run_eval:
-        print("\n[Post] Measuring trained model score...")
-        # Native PEFT model handles inference without special fusing
-        trained_model_metrics = _run_model_episodes(
-            model, tokenizer, n_episodes=3, tag="TRAINED MODEL"
-        )
-        _save_json(trained_model_metrics, Path(output_dir) / "trained_model_metrics.json")
-
-        if base_model_metrics is not None:
-            _print_improvement(base_model_metrics, trained_model_metrics)
-        else:
-            # Fallback: compare heuristic baseline vs trained model
-            _print_improvement(
-                {**baseline, "tag": "HEURISTIC BASELINE"},
-                {**trained_model_metrics, "tag": "TRAINED MODEL"},
-            )
-
-    if push_to_hub and hub_model_id:
-        print(f"\nPushing to Hub: {hub_model_id}")
-        trainer.push_to_hub(hub_model_id)
-
-    return trainer
-
-
-# ── Quick heuristic eval (no LLM needed — uses planner baseline) ──────────────
-
-def _quick_heuristic_eval(n_episodes: int = 6) -> Dict[str, Any]:
-    """Run heuristic-only multi-agent episodes (client=None → deterministic planner).
-
-    Uses run_episode so metrics are AMAN/DMAN rewards from the real multi-agent
-    environment — not single-agent grades. Same format as _run_model_episodes so
-    _print_improvement can compare them directly.
-    """
-    from multi_agent.inference import run_episode as _run_ep
-
-    env = MultiAgentATCEnvironment(seed=99)
-
-    # Fixed task list — no curriculum mutations for a stable repeatable baseline
-    eval_tasks = ["delhi_monsoon_recovery_easy", "bengaluru_irrops_hard"]
-
-    composites, aman_rews, dman_rews, conflict_list, emg_list = [], [], [], [], []
-
-    for ep in range(n_episodes):
-        task_id = eval_tasks[ep % len(eval_tasks)]
-        try:
-            r = _run_ep(
-                task_id      = task_id,
-                client       = None,   # heuristic mode — no LLM
-                env          = env,
-                curriculum   = None,
-                episode_id   = ep,
-                use_curriculum= False,
-            )
-            composites.append(float(r.get("composite", 0)))
-            aman_rews.append(float(r.get("aman_reward", 0)))
-            dman_rews.append(float(r.get("dman_reward", 0)))
-            conflict_list.append(int(r.get("conflicts", 0)))
-            emg_list.append(int(r.get("emg_arr_ok", 0)) + int(r.get("emg_dep_ok", 0)))
-        except Exception as exc:
-            print(f"  [WARN] Heuristic eval ep {ep} failed: {exc}")
-
-    def _mean(lst: list) -> float:
-        return round(sum(lst) / max(1, len(lst)), 3) if lst else 0.0
-
-    return {
-        "tag":              "HEURISTIC BASELINE",
-        "n_episodes":       n_episodes,
-        "mean_composite":   _mean(composites),
-        "mean_aman_reward": _mean(aman_rews),
-        "mean_dman_reward": _mean(dman_rews),
-        "mean_conflicts":   _mean(conflict_list),
-        "mean_emg_handled": _mean(emg_list),
-        "scores":           [round(s, 3) for s in composites],
-    }
-
-
-def _print_improvement(
-    before: Dict[str, Any], after: Dict[str, Any]
-) -> None:
-    tag_b = before.get("tag", "BEFORE")
-    tag_a = after.get("tag", "AFTER")
-    rows = [
-        ("mean_composite",   "Composite score"),
-        ("mean_aman_reward", "AMAN reward"),
-        ("mean_dman_reward", "DMAN reward"),
-        ("mean_conflicts",   "Avg conflicts"),
-        ("mean_emg_handled", "Emg handled"),
-    ]
-    width = 56
-    print(f"\n{'='*width}")
-    print(f"  BEFORE vs AFTER TRAINING")
-    print(f"  {tag_b!r:24s}  →  {tag_a!r}")
-    print(f"{'='*width}")
-    for key, label in rows:
-        bv = before.get(key, 0.0)
-        av = after.get(key, 0.0)
-        delta = av - bv
-        arrow = "↑" if delta > 0.005 else ("↓" if delta < -0.005 else "→")
-        sign = "+" if delta >= 0 else ""
-        print(f"  {label:20s}: {bv:6.3f}  →  {av:6.3f}  ({sign}{delta:.3f} {arrow})")
-    print(f"{'='*width}")
-
-
-# ── Local model client for in-process inference eval ──────────────────────────
-
-class _LocalModelClient:
-    """Duck-type OpenAI client wrapping a locally loaded Unsloth/PEFT model."""
-
-    def __init__(self, model, tokenizer):
-        self._model = model
-        self._tokenizer = tokenizer
-
-    def _create(self, *, model=None, messages, temperature=0.3, max_tokens=512, **kw):
-        import torch
-        prompt = self._tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        inputs = self._tokenizer(prompt, return_tensors="pt").to(self._model.device)
-        use_cuda = torch.cuda.is_available() and str(self._model.device).startswith("cuda")
-        cast_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        with torch.no_grad():
-            if use_cuda:
-                with torch.autocast(device_type="cuda", dtype=cast_dtype):
-                    out = self._model.generate(
-                        **inputs,
-                        max_new_tokens=min(int(max_tokens), 512),
-                        temperature=max(float(temperature), 0.01),
-                        do_sample=float(temperature) > 0.01,
-                        pad_token_id=self._tokenizer.eos_token_id,
-                    )
-            else:
-                out = self._model.generate(
-                    **inputs,
-                    max_new_tokens=min(int(max_tokens), 512),
-                    temperature=max(float(temperature), 0.01),
-                    do_sample=float(temperature) > 0.01,
-                    pad_token_id=self._tokenizer.eos_token_id,
-                )
-        text = self._tokenizer.decode(
-            out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True
-        )
-
-        class _Msg:
-            content = text
-        class _Choice:
-            message = _Msg()
-        class _Resp:
-            choices = [_Choice()]
-
-        return _Resp()
-
-    @property
-    def chat(self):
-        _self = self
-        class _Comp:
-            def create(self, **kw):
-                return _self._create(**kw)
-        class _Chat:
-            completions = _Comp()
-        return _Chat()
-
-
-def _run_model_episodes(
-    model,
-    tokenizer,
-    n_episodes: int = 3,
-    tag: str = "MODEL",
-    use_curriculum: bool = False,
-) -> Dict[str, Any]:
-    """Run multi-agent episodes using an in-process model client.
-
-    use_curriculum=False keeps tasks fixed so base and trained models
-    see identical scenarios — essential for a fair comparison.
-    """
-    from multi_agent.inference import run_episode as _run_ep
-
-    client = _LocalModelClient(model, tokenizer)
-    env = MultiAgentATCEnvironment(seed=77)
-
-    # Two representative tasks: one easy, one hard
-    eval_tasks = ["delhi_monsoon_recovery_easy", "bengaluru_irrops_hard"]
-
-    composites, aman_rews, dman_rews, conflict_list, emg_list = [], [], [], [], []
-
-    for ep in range(n_episodes):
-        task_id = eval_tasks[ep % len(eval_tasks)]
-        try:
-            r = _run_ep(
-                task_id=task_id,
-                client=client,
-                env=env,
-                curriculum=None,
-                episode_id=ep,
-                use_curriculum=False,
-                model_name="local",
-            )
-            composites.append(float(r.get("composite", 0)))
-            aman_rews.append(float(r.get("aman_reward", 0)))
-            dman_rews.append(float(r.get("dman_reward", 0)))
-            conflict_list.append(int(r.get("conflicts", 0)))
-            emg_list.append(
-                int(r.get("emg_arr_ok", 0)) + int(r.get("emg_dep_ok", 0))
-            )
-        except Exception as exc:
-            print(f"  [WARN] model eval episode {ep} failed: {exc}")
-
-    def _m(lst: list) -> float:
-        return round(sum(lst) / max(1, len(lst)), 3) if lst else 0.0
-
-    return {
-        "tag":              tag,
-        "n_episodes":       n_episodes,
-        "mean_composite":   _m(composites),
-        "mean_aman_reward": _m(aman_rews),
-        "mean_dman_reward": _m(dman_rews),
-        "mean_conflicts":   _m(conflict_list),
-        "mean_emg_handled": _m(emg_list),
-        "scores":           [round(s, 3) for s in composites],
-    }
-
-
-# ── Utilities ─────────────────────────────────────────────────────────────────
-
-def _wandb_available() -> bool:
-    try:
-        import wandb
-        return True
-    except ImportError:
-        return False
-
-
-def _save_json(data: Any, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
-
-
-def _check_reward_hacking(reward_log: Dict[str, List[float]]) -> None:
-    """Warn when mean composite rises but role rewards collapse (gaming signal)."""
-    comp = reward_log["composite"]
-    if len(comp) < 100:
-        return
-    recent_50  = comp[-50:]
-    earlier_50 = comp[-100:-50]
-    mean_recent  = sum(recent_50)  / 50
-    mean_earlier = sum(earlier_50) / 50
-    if mean_recent > mean_earlier + 0.1:
-        # Check if any role's recent std collapsed (< 0.05 = suspiciously uniform)
-        for role in ("AMAN", "DMAN"):
-            rs = reward_log.get(role, [])
-            if len(rs) >= 20:
-                recent = rs[-20:]
-                mean_r = sum(recent) / len(recent)
-                std_r = (sum((x - mean_r) ** 2 for x in recent) / len(recent)) ** 0.5
-                if std_r < 0.05:
-                    print(
-                        f"[WARN] Possible reward hacking: {role} std={std_r:.4f} "
-                        f"while composite reward is rising. Sample outputs and inspect."
-                    )
-
-
-def _print_final_stats(reward_log: Dict[str, List[float]]) -> None:
-    print("\n=== TRAINING REWARD SUMMARY ===")
-    for role, rewards in reward_log.items():
-        if not rewards:
-            continue
-        n = len(rewards)
-        first_q = rewards[:max(1, n // 4)]
-        last_q  = rewards[max(0, 3 * n // 4):]
-        mean_all   = sum(rewards) / n
-        mean_first = sum(first_q) / len(first_q)
-        mean_last  = sum(last_q)  / len(last_q)
-        trend = "↑" if mean_last > mean_first + 0.05 else (
-            "↓" if mean_last < mean_first - 0.05 else "→"
-        )
-        print(
-            f"  {role:12s}: mean={mean_all:.3f} | "
-            f"first_q={mean_first:.3f} -> last_q={mean_last:.3f} {trend}"
-        )
-
-
-# ── Evaluation loop ───────────────────────────────────────────────────────────
-
-def evaluate(model_name_or_path: str, n_episodes: int = 20, seed: int = 99) -> Dict[str, Any]:
-    """Run trained model on evaluation episodes."""
-    torch, AutoModelForCausalLM, AutoTokenizer, get_peft_model, LoraConfig, GRPOConfig, GRPOTrainer = _require_training_deps()
-
-    print(f"\nEvaluating {model_name_or_path} on {n_episodes} episodes...")
-    _dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name_or_path, 
-        torch_dtype=_dtype,
-        device_map="auto",
-        attn_implementation="flash_attention_2" if _dtype == torch.bfloat16 else "sdpa",
-    )
-
-    import random
-    from training.dataset import AMAN_SYSTEM, DMAN_SYSTEM, SUPERVISOR_PROFILES
-
-    env        = MultiAgentATCEnvironment(seed=seed)
-    _profiles  = list(SupervisorProfileName)
-    task_list  = list(ordered_tasks())
-    rng        = random.Random(seed)
-
-    results: Dict[str, List] = {
-        "aman_rewards": [], "dman_rewards": [], "composite_scores": [],
-        "conflict_counts": [], "coordination_scores": [],
-    }
-
-    for ep in range(n_episodes):
-        base_task = rng.choice(task_list)
-        profile   = _profiles[ep % len(_profiles)]
-
-        aman_obs, dman_obs = env.reset(episode_id=ep, mutated_task=base_task)
-        sup_desc = SUPERVISOR_PROFILES[profile]["description"]
-
-        def _chat(system, user):
-            msgs = [{"role": "system", "content": system}, {"role": "user", "content": user}]
-            return tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-
-        def _gen(prompt):
-            import torch as _torch
-            inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-            with _torch.no_grad():
-                out = model.generate(
-                    **inputs, max_new_tokens=MAX_NEW_TOKENS,
-                    temperature=TEMPERATURE, do_sample=True,
-                    pad_token_id=tokenizer.eos_token_id,
-                )
-            return tokenizer.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-
-        aman_comp = _gen(_chat(AMAN_SYSTEM + f"\n\nSUPERVISOR: {sup_desc}", aman_obs.to_prompt_text()))
-        dman_comp = _gen(_chat(DMAN_SYSTEM + f"\n\nSUPERVISOR: {sup_desc}", dman_obs.to_prompt_text()))
-
-        aman_action = parse_aman_action(aman_comp)
-        dman_action = parse_dman_action(dman_comp)
-        if not aman_action or not dman_action:
-            continue
-
-        aman_obs, dman_obs, _, done = env.step_bid(aman_action, dman_action)
-        if not done:
-            env.step_negotiate(aman_action, dman_action)
-
-        result = env.finalize()
-
-        results["aman_rewards"].append(result.aman_reward)
-        results["dman_rewards"].append(result.dman_reward)
-        results["composite_scores"].append(result.composite_score)
-        results["conflict_counts"].append(result.per_role.cross_lane_conflicts)
-        results["coordination_scores"].append(result.per_role.coordination_score)
-
-        print(
-            f"  ep{ep:3d} | composite={result.composite_score:.3f} | "
-            f"AMAN={result.aman_reward:.3f} | DMAN={result.dman_reward:.3f} | "
-            f"coord={result.per_role.coordination_score:.3f}"
-        )
-
-    def _mean(lst):
-        return round(sum(lst) / max(1, len(lst)), 3)
-
-    summary = {
-        "mean_composite":    _mean(results["composite_scores"]),
-        "mean_aman_reward":  _mean(results["aman_rewards"]),
-        "mean_dman_reward":  _mean(results["dman_rewards"]),
-        "mean_coordination": _mean(results["coordination_scores"]),
-        "mean_conflicts":    _mean(results["conflict_counts"]),
-    }
-    print("\n=== EVALUATION SUMMARY ===")
-    for k, v in summary.items():
-        print(f"  {k}: {v}")
-
-    return {**results, "summary": summary}
+    with open(f"{output_dir}/log.json", "w") as f:
+        json.dump(trainer.state.log_history, f, indent=2, default=str)
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    vals: List[float] = []
+    for entry in trainer.state.log_history:
+        for k in ["rewards/reward_fn", "reward", "rewards/combined_reward_fn",
+                  "rewards/reward_fn_mean"]:
+            if k in entry and isinstance(entry[k], (int, float)):
+                vals.append(float(entry[k]))
+                break
+
+    print(f"\n{'='*54}")
+    print(f"  Done in {elapsed/60:.0f} min")
+    if vals:
+        q = max(1, len(vals) // 4)
+        f_, l_ = sum(vals[:q]) / q, sum(vals[-q:]) / q
+        arrow = "↑" if l_ > f_ + 0.02 else ("↓" if l_ < f_ - 0.02 else "→")
+        print(f"  Reward: {f_:.3f} → {l_:.3f}  ({l_-f_:+.3f} {arrow})")
+    print(f"  Saved : {output_dir}")
+    print(f"{'='*54}\n")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="ADAPT-Focused ATC Multi-Agent GRPO Training")
-    parser.add_argument("--model",          default=DEFAULT_MODEL,
-                        help="Base model (default: Qwen/Qwen2.5-1.5B-Instruct)")
-    parser.add_argument("--output_dir",     default=DEFAULT_OUTPUT)
-    parser.add_argument("--episodes",       type=int, default=200)
-    parser.add_argument("--lora_rank",      type=int, default=LORA_RANK)
-    parser.add_argument("--n_generations",  type=int, default=None,
-                        help="GRPO group size (default: 2 for T4 Colab).")
-    parser.add_argument("--seed",           type=int, default=42)
-    parser.add_argument("--no_eval",      action="store_true", help="Skip before/after eval")
-    parser.add_argument("--eval_only",    action="store_true")
-    parser.add_argument("--push_to_hub",  action="store_true")
-    parser.add_argument("--hub_model_id", default=None)
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description="ADAPT ATC GRPO Training")
+    p.add_argument("--model",      default=MODEL,
+                   help="HF model name or local path (default: unsloth/Qwen2.5-1.5B-Instruct)")
+    p.add_argument("--output_dir", default="./outputs/atc-grpo")
+    p.add_argument("--episodes",   type=int, default=150,
+                   help="Training episodes. 80=fast (~1 h T4), 150=good, 300=best")
+    p.add_argument("--lora_rank",  type=int, default=LORA_RANK,
+                   help="LoRA rank. 8 for T4, 16 for A100")
+    p.add_argument("--n_gen",      type=int, default=N_GEN,
+                   help="GRPO generations per prompt. 2 for T4, 4 for A100")
+    p.add_argument("--easy",       action="store_true",
+                   help="Train AMAN+DMAN only (skip ADAPT). Faster convergence, good first run.")
+    args = p.parse_args()
 
-    # Allow CLI override of group size (useful for Colab memory tuning)
-    if args.n_generations is not None:
-        global N_GENERATIONS, BATCH_SIZE
-        N_GENERATIONS = args.n_generations
-        # Adjust batch size to stay divisible
-        if BATCH_SIZE % N_GENERATIONS != 0:
-            BATCH_SIZE = N_GENERATIONS
+    train(
+        model_name=args.model,
+        output_dir=args.output_dir,
+        n_episodes=args.episodes,
+        lora_rank=args.lora_rank,
+        easy=args.easy,
+        n_gen=args.n_gen,
+    )
 
-    if args.eval_only:
-        evaluate(args.model, n_episodes=20, seed=args.seed)
-    else:
-        train(
-            model_name=args.model,
-            output_dir=args.output_dir,
-            n_episodes=args.episodes,
-            lora_rank=args.lora_rank,
-            seed=args.seed,
-            push_to_hub=args.push_to_hub,
-            hub_model_id=args.hub_model_id,
-            run_eval=not args.no_eval,
-        )
 
-##fff
 if __name__ == "__main__":
     main()
