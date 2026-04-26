@@ -331,8 +331,9 @@ def train_sft(
     final_dir = str(Path(output_dir) / "sft-final")
     print(f"\n  Merging LoRA into base weights and saving to: {final_dir}")
     try:
-        # Unsloth preferred path: saves merged model re-quantized to 4-bit
-        model.save_pretrained_merged(final_dir, tokenizer, save_method="merged_4bit_forced")
+        # "merged_16bit" saves proper HF safetensors loadable by from_pretrained.
+        # "merged_4bit_forced" saves GGUF which is NOT loadable by HF — don't use it.
+        model.save_pretrained_merged(final_dir, tokenizer, save_method="merged_16bit")
     except Exception as e1:
         print(f"  [WARN] save_pretrained_merged failed ({e1}), trying merge_and_unload...")
         try:

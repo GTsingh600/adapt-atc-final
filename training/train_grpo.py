@@ -445,19 +445,37 @@ def train(
     # compiled GRPO path — raw full-model (no PEFT) crashes torch._dynamo.
     print(f"[1/5] Loading model with Unsloth 4-bit QLoRA (rank={lora_rank}, all projections)...")
 
-    # If loading from a merged SFT checkpoint, save_pretrained_merged may have
-    # left behind adapter_config.json without actual adapter weights.
-    # That causes PEFT to initialise a LoRA structure → Unsloth then blocks
-    # get_peft_model with "already has LoRA adapters".  Strip it first.
+    # Validate checkpoint — if it's a directory, it must contain HF weight files.
+    # save_pretrained_merged("merged_4bit_forced") produces GGUF, not HF format.
+    # Fall back to base model so training is never blocked by a bad SFT save.
+    _load_name = model_name
     if os.path.isdir(model_name):
-        for _stale in ["adapter_config.json", "adapter_model.safetensors", "adapter_model.bin"]:
-            _stale_path = os.path.join(model_name, _stale)
-            if os.path.exists(_stale_path):
-                os.remove(_stale_path)
-                print(f"  [INFO] Stripped stale {_stale} from merged SFT checkpoint")
+        _weight_files = [
+            "model.safetensors",
+            "pytorch_model.bin",
+            "model.safetensors.index.json",
+            "pytorch_model.bin.index.json",
+        ]
+        _has_weights = any(
+            os.path.exists(os.path.join(model_name, f)) for f in _weight_files
+        )
+        if not _has_weights:
+            print(
+                f"  [WARN] {model_name} has no HF weight files "
+                f"(SFT save may have used GGUF format). "
+                f"Falling back to base model: {DEFAULT_MODEL}"
+            )
+            _load_name = DEFAULT_MODEL
+        else:
+            # Strip stale PEFT config so get_peft_model can apply fresh LoRA
+            for _stale in ["adapter_config.json", "adapter_model.safetensors", "adapter_model.bin"]:
+                _p = os.path.join(model_name, _stale)
+                if os.path.exists(_p):
+                    os.remove(_p)
+                    print(f"  [INFO] Stripped stale {_stale} from SFT checkpoint")
 
     model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=model_name,
+        model_name=_load_name,
         max_seq_length=MAX_SEQ_LEN,
         load_in_4bit=True,
         dtype=None,
