@@ -291,7 +291,7 @@ def train_sft(
         "per_device_train_batch_size":   BATCH_SIZE,
         "gradient_accumulation_steps":   GRAD_ACCUM,
         "learning_rate":                 LR,
-        "warmup_ratio":                  WARMUP_RATIO,
+        "warmup_steps":                  int(num_epochs * (len(dataset) // BATCH_SIZE) * WARMUP_RATIO) if WARMUP_RATIO > 0 else 0,
         "logging_steps":                 10,
         "save_steps":                    SAVE_STEPS,
         "save_total_limit":              2,
