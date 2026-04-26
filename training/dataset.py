@@ -26,14 +26,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models import OperationType, SlotAssignment
 from tasks import task_catalog, ordered_tasks, micro_task_catalog
 from multi_agent.environment import MultiAgentATCEnvironment
-from multi_agent.generator import ChallengeGenerator
+from multi_agent.adapter import ContextAdaptiveCurriculum
 from multi_agent.models import (
     AMANAction,
     ADAPTAction,
     DMANAction,
-    GeneratorAction,
-    GeneratorMutation,
-    MutationType,
     NegotiationMessage,
     MessageType,
     AgentRole,
@@ -132,38 +129,6 @@ OUTPUT FORMAT (strict JSON, no markdown):
 }"""
 
 
-GENERATOR_SYSTEM = """You are the Scenario Generator for multi-agent ATC training.
-Your goal: mutate the scenario to make AMAN and DMAN fail to coordinate.
-You are rewarded when they score LOW. You are penalised if the scenario is UNSOLVABLE.
-
-MUTATION TYPES:
-- tighten_window: squeeze a flight's time window (make it harder to sequence)
-- inject_emergency: add a new EMERGENCY/MEDICAL arrival to disrupt sequencing
-- increase_weather_penalty: degrade runway capacity
-- add_atfm_deadline: add a hard network slot constraint to a departure
-- close_runway_window: make a runway unavailable during peak period
-- add_conflicting_flight: inject a Heavy arrival before a Light to create wake trap
-
-STRATEGY TIPS:
-- Simultaneous medical arrival + fuel emergency departure on same runway = maximum conflict
-- Injecting emergency during peak hour breaks AMAN's sequence
-- ATFM deadlines during weather degradation stress DMAN
-
-OUTPUT FORMAT (strict JSON, no markdown):
-{
-  "mutations": [
-    {
-      "mutation_type": "tighten_window|inject_emergency|increase_weather_penalty|add_atfm_deadline|close_runway_window|add_conflicting_flight",
-      "target_flight_id": "flight_id or null",
-      "target_runway_id": "runway_id or null",
-      "params": {"key": "value"},
-      "rationale": "why this breaks coordination"
-    }
-  ],
-  "strategy": "overall explanation of how these mutations disrupt AMAN/DMAN coordination"
-}"""
-
-
 ADAPT_SYSTEM = """You are ADAPT (Adaptive Decision Agent for Problem Transfer).
 
 You receive scheduling problems from UNKNOWN domains. You have NO prior knowledge
@@ -242,27 +207,11 @@ OUTPUT FORMAT (strict JSON, no markdown):
 
 
 
-SUPERVISOR_SYSTEM_TEMPLATE = """You are an ATC Supervisor evaluating a completed runway plan.
-Your preference this shift: {preference}
-
-Score the plan 0.0-1.0 based on how well it satisfies YOUR preference (not generic quality).
-Be specific about what satisfies or violates your stated priority.
-
-OUTPUT FORMAT (strict JSON, no markdown):
-{{
-  "score": 0.0,
-  "alignment": "explain how well the plan matches your stated preference",
-  "key_violations": ["list specific violations of your preference"]
-}}"""
-
-
 # ── Dataset builder ───────────────────────────────────────────────────────────
 
 def build_episode_dataset(
     n_episodes: int = 200,
     seed: int = 42,
-    include_generator: bool = False,
-    include_supervisor: bool = False,
     include_adapt: bool = True,
     domain_episode_ratio: float = 0.65,
     long_horizon_ratio: float = 0.0,
@@ -275,7 +224,6 @@ def build_episode_dataset(
     Training mix:
       - 65% domain-transfer episodes: 1 ADAPT + 1 AMAN + 1 DMAN = 3 samples
       - 35% regular ATC micro episodes: 1 AMAN + 1 DMAN = 2 samples
-      - Generator and Supervisor disabled by default
     """
     import random
     rng = random.Random(seed)
@@ -451,36 +399,6 @@ def _make_dman_sample(
     }
 
 
-def _make_generator_sample(
-    ep_id: int,
-    task,
-    profile: SupervisorProfileName,
-    difficulty_level: int,
-    ema_score: float,
-) -> Dict[str, Any]:
-    user_content = (
-        f"Current agent performance (EMA): {ema_score:.2f}\n"
-        f"Target difficulty level: {difficulty_level}/6\n\n"
-        f"Base task: {task.task_id} ({task.difficulty.value})\n"
-        f"Flights: {len(task.flights)} | Runways: {len(task.runways)}\n"
-        f"Airport: {task.airport}\n\n"
-        f"Design mutations that will make AMAN and DMAN fail to coordinate "
-        f"at difficulty level {difficulty_level}. Remember: solvable but hard."
-    )
-    return {
-        "prompt": [
-            {"role": "system", "content": GENERATOR_SYSTEM},
-            {"role": "user",   "content": user_content},
-        ],
-        "task_id":            task.task_id,
-        "agent_role":         AgentRole.GENERATOR.value,
-        "episode_id":         ep_id,
-        "round":              "generate",
-        "supervisor_profile": profile.value,
-        "controller_scores":  ema_score,
-    }
-
-
 def _make_adapt_sample(
     ep_id: int,
     obs,
@@ -499,32 +417,6 @@ def _make_adapt_sample(
         "round":              "adapt",
         "supervisor_profile": obs.supervisor_profile_name.value,
         "domain_task_json":   domain_task.model_dump_json(),
-    }
-
-
-def _make_supervisor_sample(
-    ep_id: int,
-    task,
-    profile: SupervisorProfileName,
-    sup_desc: str,
-) -> Dict[str, Any]:
-    system = SUPERVISOR_SYSTEM_TEMPLATE.format(preference=sup_desc)
-    user_content = (
-        f"Task: {task.task_id}\nAirport: {task.airport}\n"
-        f"Flights: {len(task.flights)} | Runways: {len(task.runways)}\n\n"
-        f"A merged AMAN+DMAN plan was submitted. Evaluate it against your preference."
-    )
-    return {
-        "prompt": [
-            {"role": "system", "content": system},
-            {"role": "user",   "content": user_content},
-        ],
-        "task_id":            task.task_id,
-        "agent_role":         AgentRole.SUPERVISOR.value,
-        "episode_id":         ep_id,
-        "round":              "evaluate",
-        "supervisor_profile": profile.value,
-        "merged_plan_json":   "[]",
     }
 
 
@@ -623,27 +515,6 @@ def parse_dman_action(completion: Any) -> Optional[DMANAction]:
         return None
 
 
-def parse_generator_action(completion: Any) -> Optional[GeneratorAction]:
-    raw = _extract_json(completion)
-    if not raw:
-        return None
-    try:
-        data = json.loads(raw)
-        mutations = []
-        for m in data.get("mutations", []):
-            try:
-                mutations.append(GeneratorMutation(
-                    mutation_type=MutationType(m.get("mutation_type", "tighten_window")),
-                    target_flight_id=m.get("target_flight_id"),
-                    target_runway_id=m.get("target_runway_id"),
-                    params=m.get("params", {}),
-                    rationale=m.get("rationale", ""),
-                ))
-            except Exception:
-                continue
-        return GeneratorAction(
-            mutations=mutations,
-            strategy=data.get("strategy", ""),
-        )
-    except Exception:
-        return None
+def parse_generator_action(completion: Any) -> Optional[Dict]:
+    """Legacy stub — returns None. Generator agent has been removed."""
+    return None

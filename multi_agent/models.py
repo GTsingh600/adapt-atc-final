@@ -1,10 +1,9 @@
-"""Multi-agent data models for AMAN/DMAN coordination environment.
+"""Multi-agent data models for AMAN/DMAN/ADAPT coordination environment.
 
 Architecture:
   AMAN  — Arrival Manager:  owns arrival sequencing, partial view (arrivals only)
   DMAN  — Departure Manager: owns departure sequencing, partial view (departures only)
-  GENERATOR — Adversarial self-play: mutates tasks to break coordination
-  SUPERVISOR — Snorkel AI expert: changing preferences each episode
+  ADAPT — Domain Transfer Agent: maps unknown domains to ATC parameters
 
 Negotiation protocol (3 rounds):
   Round 0 BID:       each agent submits independent plan for own flights
@@ -30,8 +29,6 @@ except ImportError:
 class AgentRole(str, Enum):
     AMAN = "AMAN"
     DMAN = "DMAN"
-    GENERATOR = "GENERATOR"
-    SUPERVISOR = "SUPERVISOR"
     ADAPT = "ADAPT"
 
 
@@ -449,8 +446,6 @@ class MultiAgentEpisodeResult(BaseModel):
     composite_score:     float
     aman_reward:         float
     dman_reward:         float
-    generator_reward:    float
-    supervisor_score:    float
     per_role:            PerRoleMetrics
     negotiation_rounds:  int
     scenario_solvable:   bool = True

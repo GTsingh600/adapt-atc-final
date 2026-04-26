@@ -582,8 +582,6 @@ def train(
     dataset_raw = build_episode_dataset(
         n_episodes=n_episodes,
         seed=seed,
-        include_generator=False,
-        include_supervisor=False,
         include_adapt=True,
         domain_episode_ratio=0.65,
         long_horizon_ratio=0.0,
@@ -826,7 +824,7 @@ def _quick_heuristic_eval(n_episodes: int = 6) -> Dict[str, Any]:
 
     env = MultiAgentATCEnvironment(seed=99)
 
-    # Fixed task list — no generator mutations for a stable repeatable baseline
+    # Fixed task list — no curriculum mutations for a stable repeatable baseline
     eval_tasks = ["delhi_monsoon_recovery_easy", "bengaluru_irrops_hard"]
 
     composites, aman_rews, dman_rews, conflict_list, emg_list = [], [], [], [], []
@@ -838,9 +836,9 @@ def _quick_heuristic_eval(n_episodes: int = 6) -> Dict[str, Any]:
                 task_id      = task_id,
                 client       = None,   # heuristic mode — no LLM
                 env          = env,
-                generator    = None,
+                curriculum   = None,
                 episode_id   = ep,
-                use_generator= False,
+                use_curriculum= False,
             )
             composites.append(float(r.get("composite", 0)))
             aman_rews.append(float(r.get("aman_reward", 0)))
@@ -956,11 +954,11 @@ def _run_model_episodes(
     tokenizer,
     n_episodes: int = 3,
     tag: str = "MODEL",
-    use_generator: bool = False,
+    use_curriculum: bool = False,
 ) -> Dict[str, Any]:
     """Run multi-agent episodes using an in-process model client.
 
-    use_generator=False keeps tasks fixed so base and trained models
+    use_curriculum=False keeps tasks fixed so base and trained models
     see identical scenarios — essential for a fair comparison.
     """
     from multi_agent.inference import run_episode as _run_ep
@@ -980,9 +978,9 @@ def _run_model_episodes(
                 task_id=task_id,
                 client=client,
                 env=env,
-                generator=None,
+                curriculum=None,
                 episode_id=ep,
-                use_generator=False,
+                use_curriculum=False,
                 model_name="local",
             )
             composites.append(float(r.get("composite", 0)))

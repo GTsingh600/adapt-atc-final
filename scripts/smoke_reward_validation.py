@@ -29,9 +29,9 @@ if str(ROOT) not in sys.path:
 
 from tasks import ordered_tasks
 from multi_agent.environment import MultiAgentATCEnvironment
-from multi_agent.generator import ChallengeGenerator
-from multi_agent.supervisor import SupervisorAgent
+from multi_agent.adapter import ContextAdaptiveCurriculum
 from multi_agent.inference import _build_aman_heuristic, _build_dman_heuristic
+from multi_agent.models import SupervisorProfileName
 from training.dataset import parse_aman_action, parse_dman_action
 from training.reward_functions import aman_reward_fn, dman_reward_fn
 
@@ -39,18 +39,18 @@ from training.reward_functions import aman_reward_fn, dman_reward_fn
 def main() -> None:
     seed = 42
     env = MultiAgentATCEnvironment(seed=seed)
-    generator = ChallengeGenerator(seed=seed)
-    supervisor = SupervisorAgent()
+    curriculum = ContextAdaptiveCurriculum(seed=seed)
     task_ids = [t.task_id for t in ordered_tasks()]
+    _profiles = list(SupervisorProfileName)
 
     print("=== 5-EPISODE SMOKE TEST: reward-signal validation ===")
 
     for ep in range(5):
         task_id = task_ids[ep % len(task_ids)]
-        profile = supervisor.sample_profile(ep)
+        profile = _profiles[ep % len(_profiles)]
 
         base_task = env._catalog[task_id]
-        mutated_task, _ = generator.mutate(base_task)
+        mutated_task, _ = curriculum.mutate(base_task)
 
         aman_obs, dman_obs = env.reset(
             task_id=task_id,

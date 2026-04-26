@@ -39,8 +39,7 @@ try:
     from ..atc_env.models import ATCAction, ATCObservation
     from ..atc_env.server.atc_environment import ATCEnvironment
     from ..multi_agent.environment import MultiAgentATCEnvironment
-    from ..multi_agent.generator import ChallengeGenerator
-    from ..multi_agent.supervisor import SupervisorAgent
+    from ..multi_agent.adapter import ContextAdaptiveCurriculum
     from ..multi_agent.inference import run_episode
     from ..multi_agent.models import (
         AMANAction, DMANAction, MultiAgentEpisodeResult, SupervisorProfileName,
@@ -49,8 +48,7 @@ except ImportError:
     from atc_env.models import ATCAction, ATCObservation
     from atc_env.server.atc_environment import ATCEnvironment
     from multi_agent.environment import MultiAgentATCEnvironment
-    from multi_agent.generator import ChallengeGenerator
-    from multi_agent.supervisor import SupervisorAgent
+    from multi_agent.adapter import ContextAdaptiveCurriculum
     from multi_agent.inference import run_episode
     from multi_agent.models import (
         AMANAction, DMANAction, MultiAgentEpisodeResult, SupervisorProfileName,
@@ -58,8 +56,7 @@ except ImportError:
 
 # Shared multi-agent singletons (serialised via lock — one env per server process)
 _ma_env        = MultiAgentATCEnvironment(seed=0)
-_ma_generator  = ChallengeGenerator(seed=0)
-_ma_supervisor = SupervisorAgent()
+_ma_curriculum = ContextAdaptiveCurriculum(seed=0)
 _MA_LOCK = asyncio.Lock()
 
 app = create_app(
@@ -87,7 +84,7 @@ class MABidRequest(BaseModel):
 class MAEpisodeRequest(BaseModel):
     task_id: str
     episode_id: int = 0
-    use_generator: bool = True
+    use_curriculum: bool = True
     use_heuristic: bool = True
 
 
@@ -159,10 +156,9 @@ async def ma_run_episode(req: MAEpisodeRequest) -> Dict[str, Any]:
                 task_id=req.task_id,
                 client=None,
                 env=_ma_env,
-                generator=_ma_generator if req.use_generator else None,
-                supervisor=_ma_supervisor,
+                curriculum=_ma_curriculum if req.use_curriculum else None,
                 episode_id=req.episode_id,
-                use_generator=req.use_generator,
+                use_curriculum=req.use_curriculum,
             )
             return result
         except Exception as exc:
@@ -187,7 +183,7 @@ async def ma_status() -> Dict[str, Any]:
         "round_number": state.round_number,
         "aman_slots_count": len(state.aman_slots),
         "dman_slots_count": len(state.dman_slots),
-        "generator_difficulty": _ma_generator.difficulty_level,
+        "curriculum_difficulty": _ma_curriculum.difficulty_level,
         "supervisor_profile": (
             state.supervisor_profile.value if state.supervisor_profile else None
         ),

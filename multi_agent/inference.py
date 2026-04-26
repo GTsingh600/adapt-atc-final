@@ -42,7 +42,7 @@ from models import (
 from planner import build_heuristic_plan, build_refined_plan, _flight_sort_key
 from tasks import task_catalog, ordered_tasks
 from multi_agent.environment import MultiAgentATCEnvironment
-from multi_agent.generator import ChallengeGenerator
+from multi_agent.adapter import ContextAdaptiveCurriculum
 from multi_agent.models import (
     AMANAction,
     AgentRole,
@@ -387,9 +387,9 @@ def run_episode(
     task_id: str,
     client,
     env: MultiAgentATCEnvironment,
-    generator: Optional[ChallengeGenerator],
+    curriculum: Optional[ContextAdaptiveCurriculum],
     episode_id: int,
-    use_generator: bool = True,
+    use_curriculum: bool = True,
     model_name: Optional[str] = None,
     transcript_dir: Optional[Path] = None,
 ) -> Dict:
@@ -400,12 +400,12 @@ def run_episode(
     sup_desc  = SUPERVISOR_PROFILES[profile]["description"]
 
     mutations_applied: List[str] = []
-    if use_generator and generator is not None:
-        mutated_task, solvable = generator.mutate(base_task)
-        gen_difficulty = generator.difficulty_level
+    if use_curriculum and curriculum is not None:
+        mutated_task, solvable = curriculum.mutate(base_task)
+        gen_difficulty = curriculum.difficulty_level
         mutations_applied = [
             m["type"]
-            for m in getattr(generator, "_mutation_history", [])[-3:]
+            for m in getattr(curriculum, "_mutation_history", [])[-3:]
         ]
 
     else:
@@ -418,7 +418,7 @@ def run_episode(
         episode_id=episode_id,
         supervisor_profile=profile,
         mutated_task=mutated_task,
-        randomize=not use_generator,
+        randomize=not use_curriculum,
     )
     selected_model = model_name or MODEL_NAME
     atfm = env._state.atfm_deadlines
@@ -485,9 +485,9 @@ def run_episode(
 
     # ── Finalize ──────────────────────────────────────────────────────────────
     result = env.finalize()
-    if generator is not None:
-        generator.update(result.composite_score)
-        gen_difficulty = generator.difficulty_level
+    if curriculum is not None:
+        curriculum.update(result.composite_score)
+        gen_difficulty = curriculum.difficulty_level
 
     episode_result = {
         "composite":      result.composite_score,
@@ -520,8 +520,6 @@ def run_episode(
                     "composite_score":    result.composite_score,
                     "aman_reward":        result.aman_reward,
                     "dman_reward":        result.dman_reward,
-                    "generator_reward":   result.generator_reward,
-                    "supervisor_score":   result.supervisor_score,
                     "coordination_score": result.per_role.coordination_score,
                     "cross_lane_conflicts": result.per_role.cross_lane_conflicts,
                     "negotiation_rounds": result.negotiation_rounds,
@@ -664,8 +662,8 @@ def main() -> None:
                         help="Number of episodes to run")
     parser.add_argument("--model",    default=MODEL_NAME,
                         help="Model name or 'heuristic-baseline'")
-    parser.add_argument("--no_generator", action="store_true",
-                        help="Disable self-play generator (use base tasks)")
+    parser.add_argument("--no_curriculum", action="store_true",
+                        help="Disable self-adapting curriculum (use base tasks)")
     parser.add_argument("--all_tasks", action="store_true",
                         help="Run all ATC tasks in sequence")
     parser.add_argument("--domain", default=None,
@@ -693,7 +691,7 @@ def main() -> None:
             _p("[WARN] openai package missing — using heuristic baseline")
 
     env       = MultiAgentATCEnvironment(seed=args.seed)
-    generator = ChallengeGenerator(seed=args.seed)
+    curriculum = ContextAdaptiveCurriculum(seed=args.seed)
 
     transcript_dir = Path(args.transcript_dir) if args.transcript_dir else None
 
@@ -746,9 +744,9 @@ def main() -> None:
                 client=client,
                 model_name=model,
                 env=env,
-                generator=generator,
+                curriculum=curriculum,
                 episode_id=ep,
-                use_generator=not args.no_generator,
+                use_curriculum=not args.no_curriculum,
                 transcript_dir=transcript_dir,
             )
             success = result["composite"] >= SUCCESS_THRESHOLD

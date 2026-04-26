@@ -69,4 +69,4 @@ class ATCState(State):
     aman_reward: float = Field(default=0.0)
     dman_reward: float = Field(default=0.0)
     composite_score: float = Field(default=0.0)
-    generator_difficulty: int = Field(default=1, ge=1, le=6)
+    curriculum_difficulty: int = Field(default=1, ge=1, le=6)

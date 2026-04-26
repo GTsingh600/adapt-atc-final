@@ -26,10 +26,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from multi_agent.environment import MultiAgentATCEnvironment
-from multi_agent.generator import ChallengeGenerator
+from multi_agent.adapter import ContextAdaptiveCurriculum
 from multi_agent.inference import run_episode
 from multi_agent.models import SUPERVISOR_PROFILES
-from multi_agent.supervisor import SupervisorAgent
 from tasks import ordered_tasks
 
 
@@ -134,7 +133,7 @@ def evaluate_model(
     n_episodes: int,
     task_ids: List[str],
     seed: int,
-    use_generator: bool,
+    use_curriculum: bool,
     label: str,
 ) -> Dict:
     """Run N episodes and return aggregated metrics."""
@@ -145,8 +144,7 @@ def evaluate_model(
 
     client    = _load_client(model_name)
     env       = MultiAgentATCEnvironment(seed=seed)
-    generator = ChallengeGenerator(seed=seed)
-    supervisor = SupervisorAgent()
+    curriculum = ContextAdaptiveCurriculum(seed=seed)
 
     records: List[Dict] = []
     t0 = time.time()
@@ -158,10 +156,9 @@ def evaluate_model(
                     task_id=task_id,
                     client=client,
                     env=env,
-                    generator=generator,
-                    supervisor=supervisor,
+                    curriculum=curriculum if use_curriculum else None,
                     episode_id=ep,
-                    use_generator=use_generator,
+                    use_curriculum=use_curriculum,
                 )
                 r["task_id"] = task_id
                 records.append(r)
@@ -240,15 +237,15 @@ def main() -> None:
                         default=["delhi_monsoon_recovery_easy",
                                  "bengaluru_irrops_hard"])
     parser.add_argument("--seed",    type=int, default=99)
-    parser.add_argument("--no_generator", action="store_true")
+    parser.add_argument("--no_curriculum", action="store_true")
     parser.add_argument("--output",  default=None, help="Save results JSON")
     args = parser.parse_args()
 
     base_results    = evaluate_model(
-        args.base,    args.episodes, args.tasks, args.seed, not args.no_generator, "BASE"
+        args.base,    args.episodes, args.tasks, args.seed, not args.no_curriculum, "BASE"
     )
     trained_results = evaluate_model(
-        args.trained, args.episodes, args.tasks, args.seed, not args.no_generator, "TRAINED"
+        args.trained, args.episodes, args.tasks, args.seed, not args.no_curriculum, "TRAINED"
     )
 
     print_comparison(base_results, trained_results)

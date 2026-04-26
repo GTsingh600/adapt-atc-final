@@ -32,8 +32,7 @@ except ImportError:
     _OPENENV_AVAILABLE = False
 
 from multi_agent.environment import MultiAgentATCEnvironment
-from multi_agent.generator import ChallengeGenerator
-from multi_agent.supervisor import SupervisorAgent
+from multi_agent.adapter import ContextAdaptiveCurriculum
 from tasks import ordered_tasks
 from training.dataset import parse_aman_action, parse_dman_action
 
@@ -61,8 +60,7 @@ class ATCEnvironment(_EnvBase):
         if _OPENENV_AVAILABLE:
             super().__init__()
         self._env = MultiAgentATCEnvironment(seed=42)
-        self._generator = ChallengeGenerator(seed=42)
-        self._supervisor = SupervisorAgent()
+        self._curriculum = ContextAdaptiveCurriculum(seed=42)
         self._task_list = list(ordered_tasks())
         self._episode_state = ATCState()
 
@@ -73,15 +71,15 @@ class ATCEnvironment(_EnvBase):
 
         kwargs accepted:
             task_id (str): specific task to load; random if omitted
-            use_generator (bool): apply adversarial mutations (default True)
+            use_curriculum (bool): apply curriculum mutations (default True)
         """
         task_id = kwargs.get("task_id")
-        use_generator = kwargs.get("use_generator", True)
+        use_curriculum = kwargs.get("use_curriculum", True)
         ep_id = int(episode_id or 0)
 
         # Apply adaptive curriculum mutation when requested
         mutated_task = None
-        if use_generator:
+        if use_curriculum:
             import random
             rng = random.Random(seed or ep_id)
             if task_id:
@@ -90,7 +88,7 @@ class ATCEnvironment(_EnvBase):
             else:
                 base = rng.choice(self._task_list)
             if base:
-                mutated_task, _ = self._generator.mutate(base)
+                mutated_task, _ = self._curriculum.mutate(base)
 
         aman_obs, dman_obs = self._env.reset(
             task_id=task_id,
@@ -102,7 +100,7 @@ class ATCEnvironment(_EnvBase):
             episode_id=str(ep_id),
             task_id=aman_obs.task_id,
             supervisor_profile=aman_obs.supervisor_profile_name.value,
-            generator_difficulty=self._generator.difficulty_level,
+            curriculum_difficulty=self._curriculum.difficulty_level,
         )
 
         return ATCObservation(
@@ -166,14 +164,14 @@ class ATCEnvironment(_EnvBase):
     def _finalize(self, partial_reward: float) -> ATCObservation:
         result = self._env.finalize()
 
-        # Update generator curriculum
-        self._generator.update(result.composite_score)
+        # Update curriculum
+        self._curriculum.update(result.composite_score)
 
         self._episode_state.aman_reward = result.aman_reward
         self._episode_state.dman_reward = result.dman_reward
         self._episode_state.composite_score = result.composite_score
         self._episode_state.negotiation_rounds = result.negotiation_rounds
-        self._episode_state.generator_difficulty = self._generator.difficulty_level
+        self._episode_state.curriculum_difficulty = self._curriculum.difficulty_level
 
         composite = (result.aman_reward + result.dman_reward) / 2.0
 

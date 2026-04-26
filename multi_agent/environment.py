@@ -244,10 +244,6 @@ class MultiAgentATCEnvironment:
 
         aman_reward  = self._aman_reward(per_role, outcome.metrics, state)
         dman_reward  = self._dman_reward(per_role, outcome.metrics, state)
-        # Generator reward: adversarial (1 - controller avg)
-        controller_avg = (aman_reward + dman_reward) / 2.0
-        generator_reward = max(-1.0, 1.0 - controller_avg)
-        supervisor_score = 0.0  # supervisor removed from active training pipeline
 
         return MultiAgentEpisodeResult(
             task_id=state.task.task_id,
@@ -255,8 +251,6 @@ class MultiAgentATCEnvironment:
             composite_score=round(composite.score, 4),
             aman_reward=round(aman_reward, 4),
             dman_reward=round(dman_reward, 4),
-            generator_reward=round(generator_reward, 4),
-            supervisor_score=round(supervisor_score, 4),
             per_role=per_role,
             negotiation_rounds=state.negotiation_rounds,
         )

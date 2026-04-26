@@ -42,7 +42,7 @@ tags:
 |---|---|
 | Domain | Real ATC disruption recovery — 4 Indian airports + ICU domain transfer |
 | Problem this solves | LLMs can't plan across hours — decisions at minute 5 cascade to minute 180 |
-| Agents | AMAN, DMAN, self-adapting curriculum, rotating Supervisor, ADAPT meta-agent |
+| Agents | AMAN, DMAN, ADAPT meta-agent, self-adapting curriculum |
 | Theme | **#2 — Super Long-Horizon Planning & Instruction Following** |
 | Coordination protocol | BID → NEGOTIATE → FINAL (genuine partial observability) |
 | Novel contribution | Self-adapting curriculum (diagnoses weaknesses) + 7 research-grade loss functions |
@@ -325,10 +325,10 @@ Random agents score below 0.22 even on the easy task — the 3-layer gated grade
 │                    MultiAgentATCEnvironment                      │
 │                                                                 │
 │  ┌──────────────┐  ┌──────────────┐  ┌────────────────────┐   │
-│  │     AMAN     │  │     DMAN     │  │  Rotating Supervisor│   │
-│  │ (arrivals    │  │ (departures  │  │  5 preference       │   │
-│  │  only view)  │  │  only view)  │  │  profiles           │   │
-│  └──────┬───────┘  └──────┬───────┘  └────────────────────┘   │
+│  │     AMAN     │  │     DMAN     │  │  ADAPT (domain   │   │
+│  │ (arrivals    │  │ (departures  │  │  transfer)        │   │
+│  │  only view)  │  │  only view)  │  │                   │   │
+│  └──────┬───────┘  └──────┬───────┘  └───────────────────┘   │
 │         │                 │                                     │
 │         └────── messages ──┘                                    │
 │                    │                                            │
@@ -354,8 +354,6 @@ Random agents score below 0.22 even on the easy task — the 3-layer gated grade
           │                                                  │
           │  aman_reward_fn    ← 7 loss components          │
           │  dman_reward_fn    ← temporal credit + TCA      │
-          │  generator_reward  ← adaptive skill weighting   │
-          │  supervisor_reward ← calibration bonus           │
           │  adapt_reward_fn   ← downstream composite       │
           └──────────┬──────────────────────────────────────┘
                      │
@@ -504,7 +502,6 @@ efficiency_score = 0.35 × delay_efficiency + 0.25 × fuel_efficiency
 | `cf_advantage` (COMA) | 0.11 | Improvement over naive do-nothing baseline |
 | `theory_of_mind` | 0.09 | Pre-emptive gap left for DMAN emergency |
 | `hierarchical_bonus` | 0.08 | Strategic + tactical + operational layers |
-| `supervisor_alignment` | 0.05 | Match with active supervisor preference |
 | `recovery_bonus` | 0.06 | Recovery from round-1 baseline |
 | `temporal_credit` | 0.06 | Adaptive discounted return across rounds |
 | `rationale_score` | 0.04 | Constraint-aware explanation quality |
@@ -607,9 +604,7 @@ N=4 ensures non-degenerate std. N=2 collapses std → meaningless advantage.
 | `planner.py` | Deterministic heuristic baseline planner |
 | `constants.py` | Wake separation matrix, scoring weights, shared constants |
 | `multi_agent/adapter.py` | **ContextAdaptiveCurriculum** — self-adapting, skill-targeted curriculum |
-| `multi_agent/generator.py` | Backwards-compat shim → delegates to adapter.py |
 | `multi_agent/environment.py` | MultiAgentATCEnvironment (BID/NEGOTIATE/FINAL protocol) |
-| `multi_agent/supervisor.py` | 5 rotating preference profiles |
 | `multi_agent/adapt.py` | ADAPT meta-agent — structural domain transfer |
 | `multi_agent/inference.py` | Multi-agent heuristic/LLM episode runner |
 | `training/loss_functions.py` | **7 novel loss components**: TCA, hierarchical, recovery, contrastive, ITC, causal, adaptive KL |

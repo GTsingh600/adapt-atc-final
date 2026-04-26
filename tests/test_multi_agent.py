@@ -7,8 +7,7 @@ from models import SlotAssignment, OperationType
 from tasks import task_catalog
 from engine import simulate_plan
 from multi_agent.environment import MultiAgentATCEnvironment
-from multi_agent.generator import ChallengeGenerator
-from multi_agent.supervisor import SupervisorAgent
+from multi_agent.adapter import ContextAdaptiveCurriculum
 from multi_agent.models import (
     AMANAction,
     DMANAction,
@@ -151,13 +150,15 @@ def test_finalize_per_role_flight_counts(env, easy_task):
     assert result.per_role.departure_count == n_dep
 
 
-def test_generator_reward_bounded(env, easy_task):
+def test_rewards_bounded(env, easy_task):
     aman_obs, dman_obs = env.reset(task_id=easy_task.task_id, episode_id=0)
     aman_action = _build_aman_heuristic(aman_obs)
     dman_action = _build_dman_heuristic(dman_obs, env._state.atfm_deadlines)
     env.step_bid(aman_action, dman_action)
     result = env.finalize()
-    assert -1.0 <= result.generator_reward <= 1.0
+    assert 0.0 <= result.aman_reward <= 1.0
+    assert 0.0 <= result.dman_reward <= 1.0
+    assert 0.0 <= result.composite_score <= 1.0
 
 
 # ── Multi-episode stability ───────────────────────────────────────────────────
@@ -177,91 +178,47 @@ def test_multiple_episodes_no_state_leak(env):
 
 # ── Generator ─────────────────────────────────────────────────────────────────
 
-def test_generator_mutation_produces_solvable_task(easy_task):
-    gen = ChallengeGenerator(seed=7)
-    mutated, solvable = gen.mutate(easy_task)
+def test_curriculum_mutation_produces_solvable_task(easy_task):
+    curriculum = ContextAdaptiveCurriculum(seed=7)
+    mutated, solvable = curriculum.mutate(easy_task)
     assert solvable
     assert mutated.task_id == easy_task.task_id
     assert len(mutated.runways) == len(easy_task.runways)
 
 
-def test_generator_escalates_difficulty():
-    gen = ChallengeGenerator(seed=0)
-    assert gen.difficulty_level == 1
+def test_curriculum_escalates_difficulty():
+    curriculum = ContextAdaptiveCurriculum(seed=0)
+    assert curriculum.difficulty_level == 1
     for _ in range(12):
-        gen.update(0.80)  # consistently high scores
-    assert gen.difficulty_level >= 2
+        curriculum.update(0.80)  # consistently high scores
+    assert curriculum.difficulty_level >= 2
 
 
-def test_generator_eases_on_low_scores():
-    gen = ChallengeGenerator(seed=0)
-    gen._difficulty_level = 4
+def test_curriculum_eases_on_low_scores():
+    curriculum = ContextAdaptiveCurriculum(seed=0)
+    curriculum._difficulty_level = 4
     for _ in range(12):
-        gen.update(0.15)  # consistently low scores
-    assert gen.difficulty_level <= 3
+        curriculum.update(0.15)  # consistently low scores
+    assert curriculum.difficulty_level <= 3
 
 
-def test_generator_solvability_guard(easy_task):
-    gen = ChallengeGenerator(seed=0)
-    gen._difficulty_level = 6
+def test_curriculum_solvability_guard(easy_task):
+    curriculum = ContextAdaptiveCurriculum(seed=0)
+    curriculum._difficulty_level = 6
     for _ in range(5):
-        mutated, solvable = gen.mutate(easy_task)
+        mutated, solvable = curriculum.mutate(easy_task)
         # Even at max difficulty, task should still be solvable
         if not solvable:
-            assert gen.compute_reward(0.3, solvable) == -1.0
+            assert curriculum.compute_reward(0.3, solvable) == -1.0
 
 
-# ── Supervisor ────────────────────────────────────────────────────────────────
+# ── Supervisor profiles (config data — not an agent) ─────────────────────────
 
 def test_supervisor_profile_rotation():
-    sup = SupervisorAgent()
     profiles = set()
     for ep in range(10):
-        profiles.add(sup.sample_profile(ep))
+        profiles.add(SupervisorProfileName(list(SupervisorProfileName)[ep % len(SupervisorProfileName)]))
     assert len(profiles) == len(SupervisorProfileName)
-
-
-def test_supervisor_score_bounded(easy_task):
-    sup = SupervisorAgent()
-    flights = easy_task.flights
-    slots = [
-        SlotAssignment(
-            flight_id=f.flight_id,
-            runway=f.allowed_runways[0],
-            assigned_minute=f.scheduled_minute,
-            hold_minutes=0,
-        )
-        for f in flights
-    ]
-    outcome = simulate_plan(easy_task, slots)
-    for profile in SupervisorProfileName:
-        score = sup.score_plan(outcome, easy_task, profile)
-        assert 0.0 <= score <= 1.0, f"{profile}: score {score} out of range"
-
-
-def test_supervisor_safety_strict_penalises_conflicts(easy_task):
-    """Safety strict profile should score very low when there are conflicts."""
-    sup = SupervisorAgent()
-    # Create a conflicting plan: two flights on same runway at same minute
-    f0, f1 = easy_task.flights[0], easy_task.flights[1]
-    shared_rwy = list(set(f0.allowed_runways) & set(f1.allowed_runways))
-    if not shared_rwy:
-        pytest.skip("No shared runway between first two flights")
-    slots = [
-        SlotAssignment(flight_id=f0.flight_id, runway=shared_rwy[0], assigned_minute=10, hold_minutes=0),
-        SlotAssignment(flight_id=f1.flight_id, runway=shared_rwy[0], assigned_minute=10, hold_minutes=0),
-    ]
-    # Add remaining flights
-    for f in easy_task.flights[2:]:
-        slots.append(SlotAssignment(
-            flight_id=f.flight_id, runway=f.allowed_runways[0],
-            assigned_minute=f.scheduled_minute, hold_minutes=0,
-        ))
-    outcome = simulate_plan(easy_task, slots)
-    if outcome.metrics.conflict_count == 0:
-        pytest.skip("No conflict generated — cannot test safety_strict penalty")
-    score = sup.score_plan(outcome, easy_task, SupervisorProfileName.SAFETY_STRICT)
-    assert score <= 0.45, f"Safety strict should penalise conflicts; got {score}"
 
 
 # ── Coordination grader ───────────────────────────────────────────────────────

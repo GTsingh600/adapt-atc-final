@@ -182,20 +182,17 @@ if Path(EVAL_OUT).exists():
 # ══════════════════════════════════════════════════════════════════════════════
 
 from multi_agent.environment import MultiAgentATCEnvironment
-from multi_agent.supervisor import SupervisorAgent
 from multi_agent.inference import run_episode
 
 env = MultiAgentATCEnvironment(seed=0)
-sup = SupervisorAgent()
 
 result = run_episode(
     task_id      = "bengaluru_irrops_hard",
     client       = None,          # heuristic mode — no LLM
     env          = env,
-    generator    = None,
-    supervisor   = sup,
+    curriculum   = None,
     episode_id   = 0,
-    use_generator= False,
+    use_curriculum= False,
 )
 print(f"\nHeuristic sanity: composite={result['composite']:.3f} "
       f"aman={result['aman_reward']:.3f} dman={result['dman_reward']:.3f} "

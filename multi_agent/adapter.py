@@ -183,7 +183,7 @@ class ContextAdaptiveCurriculum:
         mutated_task, is_solvable, ctx = curriculum.adapt(base_task)
         # ... run episode ...
         curriculum.record(task_id=..., skill_scores=..., composite=...)
-        generator_reward = curriculum.compute_reward(composite, is_solvable, ctx)
+        curriculum_reward = curriculum.compute_reward(composite, is_solvable, ctx)
     """
 
     def __init__(self, seed: int = 0) -> None:
@@ -339,6 +339,23 @@ class ContextAdaptiveCurriculum:
         if ema > 0.20:
             return 2
         return 1
+
+    def mutate(self, base_task: TaskDefinition) -> Tuple[TaskDefinition, bool]:
+        """Convenience shim: adapt a task and return (mutated_task, solvable).
+
+        Callers that don't need the AdaptationContext can use this instead
+        of the full ``adapt()`` API.
+        """
+        task, solvable, _ctx = self.adapt(base_task)
+        return task, solvable
+
+    def update(self, composite_score: float) -> None:
+        """Convenience shim: record a composite score for difficulty tracking.
+
+        Updates the composite history (used by ``difficulty_level`` and ``ema_score``).
+        For full skill-level recording, use ``record()`` instead.
+        """
+        self._composite_history.append(composite_score)
 
     # ── Diagnostic mutation selection ─────────────────────────────────────────
 
