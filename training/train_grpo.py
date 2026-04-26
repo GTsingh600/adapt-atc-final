@@ -48,20 +48,19 @@ def _require_training_deps():
         print("Install: pip install torch")
         sys.exit(1)
     try:
-        # Unsloth should be imported before TRL/Transformers/PEFT.
-        import unsloth  # noqa: F401
-        from unsloth import FastLanguageModel
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from peft import get_peft_model, LoraConfig
     except Exception as e:
-        print(f"[ERROR] unsloth import failed: {e}")
-        print("Install: pip install unsloth unsloth-zoo")
+        print(f"[ERROR] transformers/peft import failed: {e}")
+        print("Install: pip install transformers peft")
         sys.exit(1)
     try:
         from trl import GRPOConfig, GRPOTrainer
     except ImportError as e:
         print(f"[ERROR] Training deps missing: {e}")
-        print("Install: pip install trl transformers")
+        print("Install: pip install trl")
         sys.exit(1)
-    return torch, FastLanguageModel, GRPOConfig, GRPOTrainer
+    return torch, AutoModelForCausalLM, AutoTokenizer, get_peft_model, LoraConfig, GRPOConfig, GRPOTrainer
 
 
 from training.dataset import (
@@ -471,7 +470,7 @@ def train(
     hub_model_id: Optional[str] = None,
     run_eval:     bool = True,
 ) -> None:
-    torch, FastLanguageModel, GRPOConfig, GRPOTrainer = _require_training_deps()
+    torch, AutoModelForCausalLM, AutoTokenizer, get_peft_model, LoraConfig, GRPOConfig, GRPOTrainer = _require_training_deps()
 
     num_generations = _resolve_num_generations(BATCH_SIZE, N_GENERATIONS)
     if num_generations != N_GENERATIONS:
@@ -540,22 +539,27 @@ def train(
     _dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     print(f"  Loading with dtype={'bfloat16' if _dtype == torch.bfloat16 else 'float16'}")
 
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=_load_name,
-        max_seq_length=MAX_SEQ_LEN,
-        load_in_4bit=True,
-        dtype=_dtype,
+    tokenizer = AutoTokenizer.from_pretrained(_load_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(
+        _load_name,
+        torch_dtype=_dtype,
+        device_map="auto",
+        attn_implementation="flash_attention_2" if _dtype == torch.bfloat16 else "sdpa",
     )
-    model = FastLanguageModel.get_peft_model(
-        model,
+    
+    peft_config = LoraConfig(
         r=lora_rank,
-        lora_alpha=lora_rank * 2,   # 2x rank keeps adapter scale stable
+        lora_alpha=lora_rank * 2,
         target_modules=LORA_TARGETS,
         lora_dropout=0.0,
         bias="none",
-        use_gradient_checkpointing="unsloth",
-        random_state=seed,
+        task_type="CAUSAL_LM",
     )
+    model = get_peft_model(model, peft_config)
+    
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total     = sum(p.numel() for p in model.parameters())
     pct       = 100.0 * trainable / max(1, total)
@@ -738,41 +742,6 @@ def train(
         trainer_kwargs["config"] = grpo_config
 
     trainer = GRPOTrainer(**trainer_kwargs)
-    
-    # ── CRITICAL: Apply ALL compatibility patches BEFORE any training ──
-    _maybe_patch_trainer_sampler(trainer)
-    _maybe_patch_unsloth_grad_accum(trainer)
-    _maybe_patch_unsloth_loss_type(trainer)
-    _maybe_patch_unsloth_runtime_attrs(trainer)
-    _maybe_patch_unsloth_args_attrs(trainer)
-    _maybe_patch_nanmin_symbols()
-    
-    # ── ADD THIS: Extra safety check for any remaining missing attrs ──
-    # Some Unsloth compiled paths access these directly on the trainer
-    _safety_attrs = {
-        "importance_sampling_level": "token",
-        "epsilon_low": 0.2,
-        "epsilon_high": 0.2,
-        "vllm_importance_sampling_cap": 2.0,
-        "current_gradient_accumulation_steps": getattr(trainer, "current_gradient_accumulation_steps", 1),
-    }
-    for attr, default in _safety_attrs.items():
-        if not hasattr(trainer, attr):
-            setattr(trainer, attr, default)
-            print(f"[SAFETY] Added missing trainer.{attr} = {default!r}")
-    
-    # ── ADD THIS: Delete stale compiled cache so Unsloth rebuilds with patched attrs ──
-    import shutil
-    compiled_cache_dirs = [
-        Path.cwd() / "unsloth_compiled_cache",
-        Path.home() / ".cache" / "unsloth" / "compiled_cache",
-    ]
-    for cache_dir in compiled_cache_dirs:
-        if cache_dir.exists():
-            shutil.rmtree(cache_dir, ignore_errors=True)
-            print(f"[INFO] Deleted stale compiled cache: {cache_dir}")
-    
-    # Now train with fresh cache
     trainer.train()
 
     # ── Save ──────────────────────────────────────────────────────────────────
@@ -789,7 +758,7 @@ def train(
     # ── Post-training eval ────────────────────────────────────────────────────
     if run_eval:
         print("\n[Post] Measuring trained model score...")
-        FastLanguageModel.for_inference(model)  # fuse LoRA weights for faster generation
+        # Native PEFT model handles inference without special fusing
         trained_model_metrics = _run_model_episodes(
             model, tokenizer, n_episodes=3, tag="TRAINED MODEL"
         )
@@ -1072,13 +1041,17 @@ def _print_final_stats(reward_log: Dict[str, List[float]]) -> None:
 
 def evaluate(model_name_or_path: str, n_episodes: int = 20, seed: int = 99) -> Dict[str, Any]:
     """Run trained model on evaluation episodes."""
-    torch, FastLanguageModel, _, _ = _require_training_deps()
+    torch, AutoModelForCausalLM, AutoTokenizer, get_peft_model, LoraConfig, GRPOConfig, GRPOTrainer = _require_training_deps()
 
     print(f"\nEvaluating {model_name_or_path} on {n_episodes} episodes...")
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name_or_path, max_seq_length=MAX_SEQ_LEN, load_in_4bit=True,
+    _dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name_or_path, 
+        torch_dtype=_dtype,
+        device_map="auto",
+        attn_implementation="flash_attention_2" if _dtype == torch.bfloat16 else "sdpa",
     )
-    FastLanguageModel.for_inference(model)
 
     import random
     from training.dataset import AMAN_SYSTEM, DMAN_SYSTEM, SUPERVISOR_PROFILES

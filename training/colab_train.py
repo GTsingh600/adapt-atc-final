@@ -41,7 +41,7 @@ subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "trl"], check=Fa
 subprocess.run(
     [
         sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir",
-        "unsloth[colab-new]",
+        "flash-attn>=2.5.0",
         "trl==0.15.2",
         "transformers==4.51.3",
         "accelerate>=0.32.0",

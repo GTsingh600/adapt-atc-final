@@ -225,25 +225,32 @@ def train_sft(
     print(f"  Built in {time.time()-t0:.1f}s\n")
 
     # ── 2. Load model ────────────────────────────────────────────────────
-    print(f"[2/4] Loading model with Unsloth QLoRA (rank={lora_rank})...")
-    from unsloth import FastLanguageModel
+    print(f"[2/4] Loading model with HF PEFT (rank={lora_rank})...")
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from peft import get_peft_model, LoraConfig
 
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=model_name,
-        max_seq_length=MAX_SEQ_LEN,
-        load_in_4bit=True,
-        dtype=None,
+    _dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=_dtype,
+        device_map="auto",
+        attn_implementation="flash_attention_2" if _dtype == torch.bfloat16 else "sdpa",
     )
-    model = FastLanguageModel.get_peft_model(
-        model,
+    
+    peft_config = LoraConfig(
         r=lora_rank,
         lora_alpha=LORA_ALPHA,
         target_modules=LORA_TARGETS,
         lora_dropout=0.05,
         bias="none",
-        use_gradient_checkpointing="unsloth",
-        random_state=seed,
+        task_type="CAUSAL_LM",
     )
+    model = get_peft_model(model, peft_config)
     print(f"  Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}\n")
 
     # ── 3. Prepare dataset — pre-apply chat template → `text` column ────────
@@ -331,22 +338,14 @@ def train_sft(
     final_dir = str(Path(output_dir) / "sft-final")
     print(f"\n  Merging LoRA into base weights and saving to: {final_dir}")
     try:
-        # "merged_16bit" saves proper HF safetensors loadable by from_pretrained.
-        # "merged_4bit_forced" saves GGUF which is NOT loadable by HF — don't use it.
-        model.save_pretrained_merged(final_dir, tokenizer, save_method="merged_16bit")
-    except Exception as e1:
-        print(f"  [WARN] save_pretrained_merged failed ({e1}), trying merge_and_unload...")
-        try:
-            merged = model.merge_and_unload()
-            merged.save_pretrained(final_dir)
-            tokenizer.save_pretrained(final_dir)
-        except Exception as e2:
-            print(f"  [WARN] merge_and_unload failed ({e2}), saving raw LoRA checkpoint")
-            model.save_pretrained(final_dir)
-            tokenizer.save_pretrained(final_dir)
-    # Remove stale PEFT config files — merged model has no adapters,
-    # but save_pretrained_merged sometimes leaves adapter_config.json behind,
-    # which causes GRPO's get_peft_model to fail with "already has LoRA".
+        merged = model.merge_and_unload()
+        merged.save_pretrained(final_dir)
+        tokenizer.save_pretrained(final_dir)
+    except Exception as e2:
+        print(f"  [WARN] merge_and_unload failed ({e2}), saving raw LoRA checkpoint")
+        model.save_pretrained(final_dir)
+        tokenizer.save_pretrained(final_dir)
+    # Remove stale PEFT config files if present (should not be after merge)
     for _stale in ["adapter_config.json", "adapter_model.safetensors", "adapter_model.bin"]:
         _stale_path = os.path.join(final_dir, _stale)
         if os.path.exists(_stale_path):
