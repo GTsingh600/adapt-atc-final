@@ -54,7 +54,7 @@ LORA_TARGETS   = [
     "q_proj", "v_proj", "k_proj", "o_proj",
     "gate_proj", "up_proj", "down_proj",
 ]
-MAX_SEQ_LEN    = 1024   # matches GRPO budget; covers all micro+ADAPT prompts
+MAX_SEQ_LEN    = 2048   # matches GRPO; full system prompt + task + completion fits
 LR             = 2e-5   # SFT can use higher LR than GRPO
 BATCH_SIZE     = 2
 GRAD_ACCUM     = 4      # effective batch = 8

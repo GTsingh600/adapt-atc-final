@@ -104,7 +104,7 @@ LORA_TARGETS = [
     "gate_proj", "up_proj", "down_proj",       # FFN / MLP
 ]
 
-MAX_SEQ_LEN    = 1024   # 1.5B sweet spot: fits T4 VRAM, covers all micro+ADAPT prompts
+MAX_SEQ_LEN    = 2048   # AMAN/DMAN system prompts + task content + completion = ~1700 tokens
 MAX_NEW_TOKENS = 192    # ADAPT output ~120 tokens, micro AMAN/DMAN ~150; 192 is safe
 TEMPERATURE    = 0.8    # exploration for GRPO group diversity
 N_GENERATIONS  = 2      # T4 practical max
