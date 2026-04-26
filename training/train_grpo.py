@@ -104,8 +104,9 @@ LORA_TARGETS = [
     "gate_proj", "up_proj", "down_proj",       # FFN / MLP
 ]
 
-MAX_SEQ_LEN    = 2048   # AMAN/DMAN system prompts + task content + completion = ~1700 tokens
-MAX_NEW_TOKENS = 192    # ADAPT output ~120 tokens, micro AMAN/DMAN ~150; 192 is safe
+MAX_SEQ_LEN    = 2560   # prompt ~1700 + completion 384 = 2084; 2560 gives safe headroom
+MAX_NEW_TOKENS = 384    # AMAN/DMAN JSON with 3 slots + rationale + messages = ~280 tokens
+                        # 192 was too short → 95% clipped → parse-fail → reward_std=0
 TEMPERATURE    = 0.8    # exploration for GRPO group diversity
 N_GENERATIONS  = 2      # T4 practical max
 BATCH_SIZE     = 2
@@ -361,6 +362,51 @@ def _select_sample_value(value: Any, index: int) -> Any:
     return value
 
 
+# ── Partial credit helpers ────────────────────────────────────────────────────
+# When the main reward function returns 0 (parse fail / truncated JSON),
+# these give VARIABLE partial credit so GRPO sees non-zero reward std.
+# Without variance, GRPO advantage = 0 → zero gradient for that role.
+
+def _aman_partial_credit(completion: str) -> float:
+    """Variable partial credit for AMAN — counts valid slot structures."""
+    import re as _re
+    text = str(completion).strip()
+    s = 0.0
+    if text.startswith("{"):            s += 0.04
+    if '"arrival_slots"' in text:      s += 0.08
+    # each parseable flight_id+runway pair = 1 valid slot attempt
+    n = len(_re.findall(r'"flight_id"\s*:\s*"[A-Z0-9]+', text))
+    s += min(n * 0.07, 0.35)
+    if '"rationale"' in text:          s += 0.04
+    if text.rstrip().endswith("}"):    s += 0.04
+    return round(min(s, 0.55), 4)
+
+
+def _dman_partial_credit(completion: str) -> float:
+    """Variable partial credit for DMAN — counts valid slot structures."""
+    import re as _re
+    text = str(completion).strip()
+    s = 0.0
+    if text.startswith("{"):            s += 0.04
+    if '"departure_slots"' in text:    s += 0.08
+    n = len(_re.findall(r'"flight_id"\s*:\s*"[A-Z0-9]+', text))
+    s += min(n * 0.07, 0.35)
+    if '"rationale"' in text:          s += 0.04
+    if text.rstrip().endswith("}"):    s += 0.04
+    return round(min(s, 0.55), 4)
+
+
+def _format_exploration_bonus(completion: str) -> float:
+    """Micro-bonus for JSON structure — breaks reward_std=0 cold-start."""
+    import re as _re
+    text = str(completion).strip()
+    n_json = len(_re.findall(r'[{}"\[\]:]', text))
+    bonus = min(n_json * 0.003, 0.08)
+    if text.startswith("{"):  bonus += 0.01
+    if "}" in text:           bonus += 0.01
+    return round(min(bonus, 0.10), 4)
+
+
 # ── Unified reward dispatcher ─────────────────────────────────────────────────
 
 def combined_reward_fn(completions: List[str], **kwargs) -> List[float]:
@@ -387,13 +433,28 @@ def combined_reward_fn(completions: List[str], **kwargs) -> List[float]:
             r = fn([completion], **sample_kwargs)
             if not r:
                 raise RuntimeError(f"empty reward list for role={role}")
-            rewards.append(r[0])
+            base_r = r[0]
         except Exception as exc:
             msg = f"reward_fn({role}) failed at index={i}: {exc}"
             if failure_mode == "strict":
                 raise RuntimeError(msg) from exc
             print(f"[WARN] {msg}")
-            rewards.append(-1.0)
+            base_r = -1.0
+
+        # When AMAN/DMAN parse completely fails (base_r ≤ 0), substitute
+        # partial credit so GRPO sees non-zero reward variance across the
+        # group.  Without variance, reward_std=0 → zero advantage → no
+        # gradient for that role.  Partial credit is capped at 0.55 so the
+        # full reward (0.4-0.9) still dominates once the model learns JSON.
+        if base_r <= 0.0:
+            if role == AgentRole.AMAN.value:
+                base_r = _aman_partial_credit(completion)
+            elif role == AgentRole.DMAN.value:
+                base_r = _dman_partial_credit(completion)
+            else:
+                base_r = _format_exploration_bonus(completion)
+
+        rewards.append(round(base_r, 5))
 
     return rewards
 
@@ -474,11 +535,16 @@ def train(
                     os.remove(_p)
                     print(f"  [INFO] Stripped stale {_stale} from SFT checkpoint")
 
+    # Explicit dtype prevents FlashAttention "only supports fp16/bf16" crash
+    # when dtype=None auto-detects float32 on some GPU/driver combos.
+    _dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    print(f"  Loading with dtype={'bfloat16' if _dtype == torch.bfloat16 else 'float16'}")
+
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=_load_name,
         max_seq_length=MAX_SEQ_LEN,
         load_in_4bit=True,
-        dtype=None,
+        dtype=_dtype,
     )
     model = FastLanguageModel.get_peft_model(
         model,
@@ -511,7 +577,7 @@ def train(
 
     # ── 3. Build ADAPT-focused training dataset ────────────────────────────────
     print(f"\n[2/5] Building {n_episodes}-episode ADAPT-first dataset...")
-    print(f"      ADAPT domain ratio=0.65  |  Generator=OFF  |  Supervisor=OFF")
+    print(f"      domain_episode_ratio=0.65  |  3 roles: ADAPT + AMAN + DMAN")
     t0 = time.time()
     dataset_raw = build_episode_dataset(
         n_episodes=n_episodes,
@@ -519,8 +585,8 @@ def train(
         include_generator=False,
         include_supervisor=False,
         include_adapt=True,
-        domain_episode_ratio=0.65,      # 65% domain-transfer ADAPT episodes (primary role)
-        long_horizon_ratio=0.0,         # disabled for stable convergence
+        domain_episode_ratio=0.65,
+        long_horizon_ratio=0.0,
     )
     print(f"    Dataset: {len(dataset_raw)} samples ({time.time()-t0:.1f}s)")
 
@@ -540,8 +606,10 @@ def train(
 
     # ── 4. GRPO config ────────────────────────────────────────────────────────
     kl_coeff = _effective_kl_coeff()
+    _n_epochs = 4   # 4 epochs: more gradient steps, all 3 roles converge
     print(
-        f"\n[3/5] Configuring GRPO (group_size={num_generations}, lr={LR}, kl={kl_coeff})..."
+        f"\n[3/5] Configuring GRPO (group_size={num_generations}, lr={LR}, "
+        f"kl={kl_coeff}, epochs={_n_epochs})..."
     )
     grpo_kwargs: Dict[str, Any] = {
         "num_generations":              num_generations,
@@ -549,7 +617,7 @@ def train(
         "learning_rate":                LR,
         "per_device_train_batch_size":  BATCH_SIZE,
         "gradient_accumulation_steps":  GRAD_ACCUM,
-        "num_train_epochs":             1,
+        "num_train_epochs":             _n_epochs,
         "warmup_ratio":                 WARMUP_RATIO,
         "logging_steps":                10,
         "save_steps":                   SAVE_STEPS,
